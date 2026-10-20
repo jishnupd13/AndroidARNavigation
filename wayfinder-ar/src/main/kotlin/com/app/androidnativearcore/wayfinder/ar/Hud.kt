@@ -49,6 +49,7 @@ import kotlin.math.min
 
 private val panel = Color(0xCC1C1C1E)
 private val cyan = Color(0xFF32ADE6)
+private val routeRed = Color(0xFFFF2D2D)
 
 /** Top banner with the next instruction, its distance, and the remaining distance and time. */
 @Composable
@@ -132,7 +133,7 @@ fun MiniMapView(route: Route?, level: String?, destination: Venue.POI, venue: Ve
                 pathEffect = if (dashed) PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 4.dp.toPx())) else null))
         }
         strokePath(other, Color.White.copy(alpha = 0.35f), 3.dp.toPx(), dashed = true)
-        strokePath(onLevel, cyan, 4.dp.toPx(), dashed = false)
+        strokePath(onLevel, routeRed, 4.dp.toPx(), dashed = false)
 
         if (destination.level == level) {
             val p = venue.position(destination)

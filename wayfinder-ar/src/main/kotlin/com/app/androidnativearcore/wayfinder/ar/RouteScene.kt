@@ -35,7 +35,8 @@ object RouteStyle {
     /** POIs farther than this from the route aren't labelled. */
     const val POI_LABEL_RANGE = 30f
 
-    val cyan = Color(0xFF32ADE6)
+    /** The route arrows (and the mini-map route). */
+    val arrow = Color(0xFFFF2D2D)
     val red = Color(0xFFFF3B30)
     val orange = Color(0xFFFF9500)
     val darkGray = 0xFF555555.toInt()
@@ -60,12 +61,10 @@ fun ARSceneScope.RouteScene(
     if (route == null || level == null) return
 
     // Root pose: venue -> session. Only yaw and translation (MarkerAlignment.levelled guarantees that).
-    val xAxis = alignment.column(0)
-    val yawDegrees = Math.toDegrees(atan2(-xAxis.z, xAxis.x).toDouble()).toFloat()
-    val translation = alignment.translation
+    val (rootPosition, rootRotation) = rootPose(alignment)
     val floor = venue.level(level)?.elevation ?: 0f
 
-    Node(position = Position(translation.x, translation.y, translation.z), rotation = Rotation(y = yawDegrees)) {
+    Node(position = rootPosition, rotation = rootRotation) {
         // Floor arrows along every route segment on this level, with a brightness wave running along them.
         ArrowField(remember(route, level) { arrows(route, level) }, floor)
 
@@ -119,7 +118,7 @@ private fun arrowAlpha(seconds: Float): Float {
 private fun SceneScope.ArrowField(arrows: List<ArrowPlacement>, floor: Float) {
     // One material per arrow so each can have its own opacity.
     val materials = remember(arrows, materialLoader) {
-        arrows.map { materialLoader.createColorInstance(RouteStyle.cyan.copy(alpha = RouteStyle.ARROW_MIN_ALPHA)) }
+        arrows.map { materialLoader.createColorInstance(RouteStyle.arrow.copy(alpha = RouteStyle.ARROW_MIN_ALPHA)) }
     }
     androidx.compose.runtime.LaunchedEffect(materials) {
         val start = androidx.compose.runtime.withFrameNanos { it }
@@ -127,7 +126,7 @@ private fun SceneScope.ArrowField(arrows: List<ArrowPlacement>, floor: Float) {
             val seconds = (androidx.compose.runtime.withFrameNanos { it } - start) / 1_000_000_000f
             materials.forEachIndexed { index, material ->
                 // Each arrow starts 0.12 s after the previous one, so the wave runs toward the destination.
-                material.setColor(RouteStyle.cyan.copy(alpha = arrowAlpha(seconds - index * 0.12f % RouteStyle.PULSE_PERIOD)))
+                material.setColor(RouteStyle.arrow.copy(alpha = arrowAlpha(seconds - index * 0.12f % RouteStyle.PULSE_PERIOD)))
             }
         }
     }
@@ -159,10 +158,10 @@ private fun SceneScope.DestinationPin(position: Position, name: String, cameraPo
     Node(position = Position(position.x, position.y + bob, position.z)) {
         CylinderNode(radius = 0.015f, height = 1.2f, position = Position(y = 0.6f), materialInstance = redMaterial)
         SphereNode(radius = 0.09f, position = Position(y = 1.25f), materialInstance = redMaterial)
-        // SceneView's torus lies in the x-y plane; lay it flat on the floor like the SceneKit ring.
+        // SceneView's torus already lies flat, like the SceneKit ring on the floor.
         TorusNode(
             majorRadius = 0.5f, minorRadius = 0.02f, position = Position(y = 0.02f),
-            rotation = Rotation(x = 90f), scale = Scale(ringScale, ringScale, ringScale), materialInstance = ringMaterial,
+            scale = Scale(ringScale, ringScale, ringScale), materialInstance = ringMaterial,
         )
         Badge(bitmap, height = 0.16f, position = Position(y = 1.6f), cameraPosition = cameraPosition)
     }

@@ -461,21 +461,58 @@ class WalkedPathTest {
 
     @Test
     fun recorderAddsAPointEveryQuarterMeterAndLinksThem() {
-        val recorder = WalkRecorder("L0", floorHeight = 0f, runId = "r")
+        val recorder = SessionPathRecorder(runId = "r", smoothing = 1f) // no smoothing: positions taken as they are
         for (i in 0..32) recorder.record(Vec3(0f, 1.4f, i * 0.125f)) // 4 m in 12.5 cm steps (exact in floating point)
         assertEquals(17, recorder.points.size) // 0, 0.25, ..., 4.0
         assertEquals((0..16).toList(), recorder.points.map { it.sequence })
-        assertTrue(recorder.points.all { it.y == 0f && it.run == "r" })
         assertNear(4f, recorder.lengthMeters, 0.01f)
     }
 
     @Test
+    fun smoothingEvensOutHandSway() {
+        // Walking straight along z while the phone sways up to 6 cm sideways, a different phase at every sample.
+        fun sidewaysSpread(smoothing: Float): Float {
+            val recorder = SessionPathRecorder(runId = "r", smoothing = smoothing)
+            for (i in 0..80) recorder.record(Vec3(0.06f * kotlin.math.sin(i * 2.0f), 1.4f, i * 0.0625f))
+            val xs = recorder.points.map { it.position.x }
+            return xs.max() - xs.min()
+        }
+        assertTrue("smoothed path wobbles less", sidewaysSpread(0.5f) < sidewaysSpread(1f) * 0.7f)
+        // It still follows the walk: the recorded path reaches (nearly) the end.
+        val recorder = SessionPathRecorder(runId = "r")
+        for (i in 0..80) recorder.record(Vec3(0f, 1.4f, i * 0.0625f))
+        assertTrue(recorder.lengthMeters > 4.5f)
+    }
+
+    @Test
     fun recorderStartsANewRunAfterATrackingJump() {
-        val recorder = WalkRecorder("L0", floorHeight = 0f, runId = "r")
+        val recorder = SessionPathRecorder(runId = "r")
         recorder.record(Vec3(0f, 1.4f, 0f))
         recorder.record(Vec3(0f, 1.4f, 20f)) // jump
         assertEquals(2, recorder.points.map { it.run }.distinct().size)
         assertEquals(0, recorder.points.last().sequence)
+    }
+
+    @Test
+    fun sessionWalkConvertsToVenueCoordinatesWithTheFinalAlignment() {
+        val venue = makeVenue()
+        // The venue sits at yaw 90° and is shifted in the session; a walk straight "up" venue z by 4 m.
+        val alignment = Mat4.yaw(90f, Vec3(10f, 0f, 20f))
+        val sessionWalk = (0..4).map { RawWalkPoint("r", it, alignment.transformPoint(Vec3(1f, 1.4f, it.toFloat()))) }
+        val walked = sessionWalk.toWalkedPoints(venue, alignment.inverse(), "L0")
+        assertEquals(5, walked.size)
+        walked.forEachIndexed { i, p ->
+            assertNear(1f, p.x, 1e-3f); assertNear(i.toFloat(), p.z, 1e-3f)
+            assertNear(0f, p.y, 1e-6f) // on the floor of level L0
+            assertEquals("L0", p.level)
+        }
+    }
+
+    @Test
+    fun straightWalkStartsAtTheSign() {
+        val points = straightWalk(Vec3(0f, 0f, 0f), Vec3(0f, 0f, 2f), "s", "L0", 0f)
+        assertEquals(4, points.size) // 0, 0.5, 1.0, 1.5 (the end point itself is left to the recorder)
+        assertNear(0f, points.first().z); assertNear(1.5f, points.last().z)
     }
 
     @Test
@@ -508,34 +545,177 @@ class AlignmentFilterTest {
     fun closerSightingsCountMore() {
         assertTrue(AlignmentFilter.weight(0.5f) > AlignmentFilter.weight(1.5f))
         assertTrue(AlignmentFilter.weight(1.5f) > AlignmentFilter.weight(4f))
-        assertNear(0.5f, AlignmentFilter.weight(1.5f), 1e-4f)
+        assertNear(1f, AlignmentFilter.weight(0.5f), 1e-4f)
+        assertNear(0.25f, AlignmentFilter.weight(1.5f), 1e-4f)
     }
 
     @Test
-    fun farSightingNudgesAndCloseSightingPullsHarder() {
-        // Truth is x = 1.0. A first, far sighting was off by 0.4 m; sightings are then 0.2 m off the truth.
+    fun aCloseSightingOutweighsAFarOne() {
+        // The truth is x = 1.0. A first sighting from far away read 1.4; a second reads the truth.
         val far = AlignmentFilter().apply { update(Mat4.yaw(0f, Vec3(1.4f, 0f, 0f)), 4f) }
         val close = AlignmentFilter().apply { update(Mat4.yaw(0f, Vec3(1.4f, 0f, 0f)), 4f) }
-        far.update(Mat4.yaw(0f, Vec3(1.0f, 0f, 0f)), 4f)
-        close.update(Mat4.yaw(0f, Vec3(1.0f, 0f, 0f)), 0.5f)
+        far.update(Mat4.yaw(0f, Vec3(1.0f, 0f, 0f)), 4f)    // equally unreliable: halfway
+        close.update(Mat4.yaw(0f, Vec3(1.0f, 0f, 0f)), 0.5f) // much more reliable: nearly the truth
         val farError = kotlin.math.abs(far.alignment.translation.x - 1f)
         val closeError = kotlin.math.abs(close.alignment.translation.x - 1f)
-        assertTrue("both improve", farError < 0.4f && closeError < 0.4f)
-        assertTrue("close scan corrects more ($closeError < $farError)", closeError < farError)
+        assertNear(0.2f, farError, 0.01f)
+        assertTrue("close scan wins ($closeError < $farError)", closeError < 0.05f)
     }
 
     @Test
-    fun yawBlendsThroughTheShortestWay() {
-        // 170° and -170° are 20° apart across the wrap, not 340°.
-        val blended = AlignmentFilter.blend(Mat4.yaw(170f), Mat4.yaw(-170f), 0.5f)
-        val degrees = Math.toDegrees(AlignmentFilter.yaw(blended).toDouble())
-        assertEquals(180.0, kotlin.math.abs(degrees), 0.01)
+    fun averagingManySightingsCancelsNoise() {
+        // Ten sightings with +-4 cm of alternating noise around x = 2.0: the average sits on the truth.
+        val filter = AlignmentFilter()
+        for (i in 0 until 10) filter.update(Mat4.yaw(0f, Vec3(if (i % 2 == 0) 2.04f else 1.96f, 0f, 0f)), 1f)
+        assertNear(2f, filter.alignment.translation.x, 0.005f)
+    }
+
+    @Test
+    fun oneBadReadingCannotMoveTheVenueFar() {
+        val filter = AlignmentFilter()
+        repeat(8) { filter.update(Mat4.yaw(10f, Vec3(2f, 0f, 3f)), 1f) }
+        filter.update(Mat4.yaw(40f, Vec3(2.5f, 0f, 3.5f)), 4f) // a wild, far reading
+        assertTrue("moved less than 5 cm", kotlin.math.abs(filter.alignment.translation.x - 2f) < 0.05f)
+        assertTrue("turned less than 2 degrees", kotlin.math.abs(Math.toDegrees(AlignmentFilter.yaw(filter.alignment).toDouble()) - 10.0) < 2.0)
+    }
+
+    @Test
+    fun yawAveragesThroughTheShortestWay() {
+        // 170 and -170 degrees are 20 degrees apart across the wrap, so they average to 180, not 0.
+        val filter = AlignmentFilter()
+        filter.update(Mat4.yaw(170f), 1f)
+        filter.update(Mat4.yaw(-170f), 1f)
+        assertEquals(180.0, kotlin.math.abs(Math.toDegrees(AlignmentFilter.yaw(filter.alignment).toDouble())), 0.5)
     }
 
     @Test
     fun tinyChangesAreIgnored() {
-        val filter = AlignmentFilter().apply { update(Mat4.yaw(0f, Vec3(1f, 0f, 1f)), 1f) }
-        assertFalse(filter.update(Mat4.yaw(0f, Vec3(1.02f, 0f, 1f)), 0.5f))
+        val filter = AlignmentFilter().apply { repeat(4) { update(Mat4.yaw(0f, Vec3(1f, 0f, 1f)), 1f) } }
+        assertFalse(filter.update(Mat4.yaw(0f, Vec3(1.01f, 0f, 1f)), 1f))
         assertNear(1f, filter.alignment.translation.x)
+    }
+}
+
+class AlignmentLockInTest {
+    @Test
+    fun lockInNeedsThreeCloseSightings() {
+        val filter = AlignmentFilter()
+        val a = Mat4.yaw(0f, Vec3(1f, 0f, 1f))
+        filter.update(a, 5f)
+        filter.update(a, 4f)
+        assertFalse("far sightings never lock in", filter.isLockedIn)
+        filter.update(a, 1.5f)
+        filter.update(a, 1.2f)
+        assertFalse("two close sightings are not enough", filter.isLockedIn)
+        filter.update(a, 1.0f)
+        assertTrue(filter.isLockedIn)
+        filter.reset()
+        assertFalse(filter.isLockedIn)
+    }
+}
+
+class PlacedObjectTest {
+    private fun obj(id: String, destination: String, kind: PlacedObjectKind = PlacedObjectKind.CUP) =
+        PlacedObject(id, kind, "L0", 1f, 0.7f, 2f, destinationId = destination)
+
+    @Test
+    fun objectsAreFilteredByDestination() {
+        val all = listOf(obj("a", "d1"), obj("b", "d2"), obj("c", "d1", PlacedObjectKind.GIFT))
+        assertEquals(listOf("a", "c"), all.forDestination("d1").map { it.id })
+        assertEquals(emptyList<PlacedObject>(), all.forDestination("none"))
+    }
+
+    @Test
+    fun fallbackPositionIsOnTheFloorAheadOfTheUser() {
+        val p = fallbackObjectPosition(Vec3(2f, 1.4f, 3f), headingX = 0f, headingZ = 5f, floorY = 0f, distance = 1f)
+        assertNear(2f, p.x); assertNear(0f, p.y); assertNear(4f, p.z)
+        // No heading at all: still a finite spot, not NaN.
+        val q = fallbackObjectPosition(Vec3(0f, 1.4f, 0f), 0f, 0f, 0f)
+        assertTrue(q.x.isFinite() && q.z.isFinite())
+    }
+
+    @Test
+    fun storePersistsAndRemovesWithTheDestination() {
+        val dir = Files.createTempDirectory("objects").toFile()
+        try {
+            val file = File(dir, "objects.json")
+            val store = PlacedObjectStore(file)
+            store.addAll(listOf(obj("a", "d1"), obj("b", "d2").copy(kind = PlacedObjectKind.MESSAGE, text = "Turn here!")))
+            val loaded = PlacedObjectStore(file).load()
+            assertEquals(listOf("a", "b"), loaded.map { it.id })
+            assertEquals("Turn here!", loaded[1].text)
+            assertEquals(PlacedObjectKind.MESSAGE, loaded[1].kind)
+            store.removeForDestination("d1")
+            assertEquals(listOf("b"), PlacedObjectStore(file).load().map { it.id })
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun referenceFlagSurvivesSavingAndDefaultsToOff() {
+        val dir = Files.createTempDirectory("objects").toFile()
+        try {
+            val file = File(dir, "objects.json")
+            PlacedObjectStore(file).addAll(listOf(obj("start", "d1").copy(isReference = true), obj("other", "d1")))
+            val loaded = PlacedObjectStore(file).load()
+            assertTrue(loaded.first { it.id == "start" }.isReference)
+            assertFalse(loaded.first { it.id == "other" }.isReference)
+            // Files written before the flag existed still load, with the flag off.
+            file.writeText("""[{"id":"old","kind":"cup","level":"L0","x":1,"y":0,"z":2}]""")
+            assertFalse(PlacedObjectStore(file).load().single().isReference)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun corruptFileLoadsAsEmpty() {
+        val dir = Files.createTempDirectory("objects").toFile()
+        try {
+            val file = File(dir, "objects.json").apply { writeText("[oops") }
+            assertEquals(emptyList<PlacedObject>(), PlacedObjectStore(file).load())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+}
+
+class ObjectSpreadTest {
+    @Test
+    fun aClearSpotIsKept() {
+        val spot = Vec3(1f, 0.7f, 2f)
+        assertEquals(spot, spreadObjectPosition(spot, listOf(Vec3(5f, 0f, 5f))))
+    }
+
+    @Test
+    fun anOccupiedSpotIsMovedToANearbyFreeOne() {
+        val taken = Vec3(1f, 0.7f, 2f)
+        val moved = spreadObjectPosition(taken, listOf(taken))
+        assertTrue(horizontalDistance(moved, taken) >= 0.3f)
+        assertTrue(horizontalDistance(moved, taken) <= 0.7f)
+        assertNear(0.7f, moved.y) // stays on the same surface
+    }
+
+    @Test
+    fun manyObjectsFromOneSpotAllEndUpApart() {
+        val placed = mutableListOf<Vec3>()
+        repeat(6) { placed += spreadObjectPosition(Vec3(0f, 0f, 0f), placed) }
+        for (i in placed.indices) for (j in i + 1 until placed.size) {
+            assertTrue("objects $i and $j overlap", horizontalDistance(placed[i], placed[j]) >= 0.29f)
+        }
+    }
+
+    @Test
+    fun sessionObjectConvertsToVenueCoordinatesAndYaw() {
+        val venue = makeVenue()
+        val alignment = Mat4.yaw(90f, Vec3(10f, 0f, 20f))
+        val venuePoint = Vec3(2f, 0.7f, 3f)
+        val world = alignment.transformPoint(venuePoint)
+        val inSession = PlacedObject("o", PlacedObjectKind.CUP, "L0", world.x, world.y, world.z, yawDegrees = 120f)
+        val converted = inSession.toVenue(venue, alignment.inverse(), alignmentYawDegrees = 90f, fallbackLevel = "L0")
+        assertNear(2f, converted.x, 1e-3f); assertNear(0.7f, converted.y, 1e-3f); assertNear(3f, converted.z, 1e-3f)
+        assertNear(30f, converted.yawDegrees) // 120° in the session = 30° relative to the venue
+        assertEquals("L0", converted.level)
     }
 }

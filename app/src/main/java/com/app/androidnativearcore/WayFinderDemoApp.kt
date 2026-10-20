@@ -57,6 +57,7 @@ import com.app.androidnativearcore.wayfinder.core.Route
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
+import com.app.androidnativearcore.wayfinder.core.PlacedObjectStore
 import com.app.androidnativearcore.wayfinder.core.WalkedPathStore
 import com.app.androidnativearcore.wayfinder.core.withCustomDestinations
 import com.google.ar.core.ArCoreApk
@@ -119,6 +120,9 @@ private fun WayFinderHost(basePackage: VenuePackage) {
     // The walks recorded while adding destinations; routes to those destinations follow them.
     val walkStore = remember { WalkedPathStore(File(context.filesDir, "walked_path.json")) }
     var walkedPoints by remember { mutableStateOf(walkStore.load()) }
+    // Objects placed along the walked paths, shown when navigating to their destination.
+    val objectStore = remember { PlacedObjectStore(File(context.filesDir, "placed_objects.json")) }
+    var placedObjects by remember { mutableStateOf(objectStore.load()) }
     val pkg = remember(basePackage, customDestinations) {
         basePackage.withVenue(basePackage.venue.withCustomDestinations(customDestinations))
     }
@@ -133,15 +137,20 @@ private fun WayFinderHost(basePackage: VenuePackage) {
             onNavigate = { screen = Screen.Navigate(it, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST) },
             onOpenSigns = { screen = Screen.Signs },
             onAddDestination = { screen = Screen.Capture },
-            onDeleteDestination = { customDestinations = store.remove(it.id) },
+            onDeleteDestination = {
+                customDestinations = store.remove(it.id)
+                placedObjects = objectStore.removeForDestination(it.id)
+            },
         )
         Screen.Capture -> WayFinderCaptureScreen(
             pkg = pkg,
             onSave = { captured ->
                 walkedPoints = walkStore.addAll(captured.path)
+                val destinationId = "custom-" + UUID.randomUUID()
+                placedObjects = objectStore.addAll(captured.objects.map { it.copy(destinationId = destinationId) })
                 customDestinations = store.add(
                     CustomDestination(
-                        id = "custom-" + UUID.randomUUID(),
+                        id = destinationId,
                         name = captured.name, level = captured.level, x = captured.x, z = captured.z,
                         createdAtMillis = System.currentTimeMillis(),
                     ),
@@ -177,6 +186,7 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 profile = current.profile,
                 listener = listener,
                 walkedPoints = walkedPoints,
+                placedObjects = placedObjects,
                 debug = true,
             )
         }

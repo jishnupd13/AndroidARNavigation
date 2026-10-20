@@ -114,6 +114,9 @@ class NavigationController(
 
     val route: Route? get() = uiState.route
 
+    /** True once enough close-up sign sightings have settled the alignment (before that, nothing is drawn). */
+    val isLockedIn: Boolean get() = alignmentFilter.isLockedIn
+
     private var isAligned = false
     private var needsRoute = false
     private var currentLevel: String? = null
@@ -139,11 +142,21 @@ class NavigationController(
     /** A marker was detected: [markerInSession] is the pose of the image center in session coordinates. */
     fun onMarkerDetected(marker: Venue.Marker, markerInSession: Mat4, distanceMeters: Float = 1f) {
         val candidate = MarkerAlignment.alignment(markerInSession, MarkerAlignment.transform(marker))
+        // Sightings are blended in by distance (close-ups count more) and only applied when they move the alignment
+        // by a meaningful amount, so the scene doesn't jitter.
+        val changed = alignmentFilter.update(candidate, distanceMeters)
+        if (changed) alignment = alignmentFilter.alignment
+        // The first sighting can come from several meters away, where a sign's pose is least precise. Wait for a few
+        // close-up ones before drawing anything, so everything starts out accurately placed.
+        if (!alignmentFilter.isLockedIn) {
+            showAlignmentPrompt(
+                "Hold the phone steady, 1–${AlignmentFilter.CLOSE_DISTANCE_M} m from the sign " +
+                    "(${alignmentFilter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)}/${AlignmentFilter.LOCK_IN_SIGHTINGS}).",
+            )
+            return
+        }
         val isFirstAlignment = !isAligned
-        // The first sighting aligns; later ones are blended in by distance (close-ups count more) and only
-        // applied when they move the alignment by a meaningful amount, so the scene doesn't jitter.
-        if (!alignmentFilter.update(candidate, distanceMeters)) return
-        alignment = alignmentFilter.alignment
+        if (!isFirstAlignment && !changed) return
         isAligned = true
         currentLevel = marker.level
         if (isFirstAlignment || uiState.route == null) {

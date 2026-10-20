@@ -10,11 +10,15 @@ import com.google.ar.core.AugmentedImageDatabase
 import com.google.ar.core.Config
 import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
+import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
+
+/** A surface found at a screen position: where it is, and a way to anchor something to it. */
+class SurfaceHit(val position: Vec3, val isPlane: Boolean, val createAnchor: () -> com.google.ar.core.Anchor)
 
 /** A marker ARCore is currently seeing, with the pose of its image center in session coordinates. */
 class MarkerSighting(val marker: Venue.Marker, val markerInSession: Mat4, val distanceMeters: Float)
@@ -65,7 +69,7 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
     }
 
     /** Signs ARCore is actively tracking in this frame (not merely remembered), rate-limited per sign. */
-    fun sightings(frame: Frame, nowMs: Long): List<MarkerSighting> {
+    fun sightings(frame: Frame, nowMs: Long, minIntervalMs: Long = REDETECT_INTERVAL_MS): List<MarkerSighting> {
         val out = ArrayList<MarkerSighting>()
         for (image in frame.getUpdatedTrackables(AugmentedImage::class.java)) {
             if (image.trackingState != TrackingState.TRACKING ||
@@ -73,7 +77,7 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
             ) continue
             val marker = markersByID[image.name] ?: continue
             val last = lastReportedMs[marker.id]
-            if (last != null && nowMs - last < REDETECT_INTERVAL_MS) continue
+            if (last != null && nowMs - last < minIntervalMs) continue
             lastReportedMs[marker.id] = nowMs
             val matrix = FloatArray(16)
             image.centerPose.toMatrix(matrix, 0)
@@ -88,21 +92,37 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
     }
 
     /**
-     * The point on a surface the camera is aimed at (the screen center), in session coordinates, or null if ARCore
-     * knows no surface there. Needs [configure] with `aiming = true`.
+     * The surface at screen position ([xPx], [yPx]) (e.g. where the user tapped), in session coordinates, with an
+     * ARCore anchor that keeps it glued to the real world, or null if ARCore knows no surface there.
+     *
+     * Detected planes (tables, floors, walls) are preferred: a plane is fitted from many observations and its anchor
+     * follows the plane as it is refined. Without one, the depth value is read at the tap and at four points
+     * around it and the middle one is used, so a single noisy depth sample (or the edge of an object) can't throw
+     * the position off. Needs [configure] with `aiming = true`.
      */
-    fun aimedPoint(frame: Frame, widthPx: Float, heightPx: Float, maxDistanceM: Float = 6f): Vec3? {
-        val hit = frame.hitTest(widthPx / 2, heightPx / 2).firstOrNull { result ->
+    fun surfaceAt(frame: Frame, session: Session, xPx: Float, yPx: Float, maxDistanceM: Float = 6f): SurfaceHit? {
+        fun usable(result: HitResult): Boolean {
             val trackable = result.trackable
-            result.distance <= maxDistanceM && when (trackable) {
+            return result.distance <= maxDistanceM && when (trackable) {
                 is Plane -> trackable.isPoseInPolygon(result.hitPose)
                 is DepthPoint -> true
                 is Point -> trackable.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL
                 else -> false
             }
-        } ?: return null
-        val p = hit.hitPose
-        return Vec3(p.tx(), p.ty(), p.tz())
+        }
+        fun position(p: com.google.ar.core.Pose) = Vec3(p.tx(), p.ty(), p.tz())
+
+        val atTap = frame.hitTest(xPx, yPx).filter(::usable)
+        atTap.firstOrNull { it.trackable is Plane }?.let { plane ->
+            return SurfaceHit(position(plane.hitPose), isPlane = true) { plane.createAnchor() }
+        }
+        val spread = 12f
+        val samples = listOf(0f to 0f, spread to 0f, -spread to 0f, 0f to spread, 0f to -spread).mapNotNull { (dx, dy) ->
+            frame.hitTest(xPx + dx, yPx + dy).firstOrNull { usable(it) }
+        }
+        if (samples.isEmpty()) return null
+        val median = samples.sortedBy { it.distance }[samples.size / 2]
+        return SurfaceHit(position(median.hitPose), isPlane = false) { median.createAnchor() }
     }
 
     companion object {

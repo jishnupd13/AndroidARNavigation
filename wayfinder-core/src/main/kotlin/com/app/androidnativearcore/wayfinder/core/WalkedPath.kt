@@ -198,45 +198,81 @@ class WalkedPathRouter(
     }
 }
 
-/** Records the user's walk as floor-level points, one every [spacing] meters (25 cm by default), like the iOS `WalkedPathController`. */
-class WalkRecorder(
-    val level: String,
-    private val floorHeight: Float,
+/** A recorded position in the AR session's own frame, before it is converted to venue coordinates. */
+data class RawWalkPoint(val run: String, val sequence: Int, val position: Vec3)
+
+/**
+ * Records the user's walk in the AR session's own frame, one point every [spacing] meters, like the iOS
+ * `WalkedPathController` (whose points are ARKit anchors that follow the session).
+ *
+ * Why the session frame and not venue coordinates: the venue alignment keeps being refined as signs are scanned,
+ * and every refinement would shift later points but not earlier ones, kinking the path. The session frame is
+ * stable, so the whole walk is converted once with [toWalkedPoints], using the final, best alignment.
+ */
+class SessionPathRecorder(
     private val spacing: Float = 0.25f,
     private val maxPoints: Int = 3000,
     runId: String = newRunId(),
+    /**
+     * How much of each new position is taken in (0..1). A phone held in the hand sways by several centimeters
+     * with every step; blending positions evens that out so the recorded path is the line walked, not the wobble.
+     */
+    private val smoothing: Float = 0.5f,
 ) {
     private var run = runId
     private var nextSequence = 0
     private var last: Vec3? = null
-    private val recorded = mutableListOf<WalkedPoint>()
+    private var smoothed: Vec3? = null
+    private val recorded = mutableListOf<RawWalkPoint>()
 
-    val points: List<WalkedPoint> get() = recorded
+    val points: List<RawWalkPoint> get() = recorded
 
     /** Length of everything recorded so far, in meters. */
     val lengthMeters: Float
-        get() = recorded.zipWithNext().sumOf { (a, b) -> if (a.run == b.run) horizontalDistance(a.position, b.position).toDouble() else 0.0 }.toFloat()
+        get() = recorded.zipWithNext().sumOf { (a, b) ->
+            if (a.run == b.run) horizontalDistance(a.position, b.position).toDouble() else 0.0
+        }.toFloat()
 
-    /** Call with the user's position in venue coordinates; adds a point once they have walked far enough. */
-    fun record(cameraInVenue: Vec3) {
+    /** Call with the user's position in the session frame; adds a point once they have walked far enough. */
+    fun record(cameraInSession: Vec3) {
         if (recorded.size >= maxPoints) return
+        val previousSmoothed = smoothed
+        val position = if (previousSmoothed == null) cameraInSession else Vec3(
+            previousSmoothed.x + (cameraInSession.x - previousSmoothed.x) * smoothing,
+            previousSmoothed.y + (cameraInSession.y - previousSmoothed.y) * smoothing,
+            previousSmoothed.z + (cameraInSession.z - previousSmoothed.z) * smoothing,
+        )
+        smoothed = position
         val previous = last
         if (previous != null) {
-            val moved = horizontalDistance(previous, cameraInVenue)
+            val moved = horizontalDistance(previous, position)
             if (moved < spacing) return
             // A big jump means tracking was corrected; don't link across the gap.
-            if (moved > 3f) startNewRun()
+            if (moved > 3f) {
+                startNewRun()
+                smoothed = cameraInSession
+            }
         }
-        recorded += WalkedPoint(run, nextSequence, level, cameraInVenue.x, floorHeight, cameraInVenue.z)
+        val point = smoothed ?: position
+        recorded += RawWalkPoint(run, nextSequence, point)
         nextSequence += 1
-        last = cameraInVenue
+        last = point
     }
 
-    /** Adds a point at a known place (e.g. the sign the user started from), regardless of spacing. */
+    /** Adds a point at [position] regardless of spacing (e.g. exactly where the user stands when saving). */
     fun recordAnchor(position: Vec3) {
-        recorded += WalkedPoint(run, nextSequence, level, position.x, floorHeight, position.z)
+        recorded += RawWalkPoint(run, nextSequence, position)
         nextSequence += 1
         last = position
+        smoothed = position
+    }
+
+    fun clear() {
+        recorded.clear()
+        last = null
+        smoothed = null
+        nextSequence = 0
+        run = newRunId()
     }
 
     private fun startNewRun() {
@@ -246,6 +282,30 @@ class WalkRecorder(
 
     companion object {
         fun newRunId(): String = java.util.UUID.randomUUID().toString().replace("-", "").take(8)
+    }
+}
+
+/**
+ * Converts a session-frame walk to venue coordinates with [venueFromSession] (the inverse of the final
+ * alignment). Each point goes on the level its height belongs to, at that level's floor height.
+ */
+fun List<RawWalkPoint>.toWalkedPoints(venue: Venue, venueFromSession: Mat4, fallbackLevel: String): List<WalkedPoint> =
+    map { raw ->
+        val v = venueFromSession.transformPoint(raw.position)
+        val level = venue.level(forDeviceHeight = v.y)?.id ?: fallbackLevel
+        WalkedPoint(raw.run, raw.sequence, level, v.x, venue.level(level)?.elevation ?: 0f, v.z)
+    }
+
+/**
+ * A straight run of points every [spacing] meters from [from] up to (not including) [to], on one floor. Used to
+ * start a recorded path at the sign itself: the user just looked at it, so the way between is clear.
+ */
+fun straightWalk(from: Vec3, to: Vec3, run: String, level: String, floorY: Float, spacing: Float = 0.5f): List<WalkedPoint> {
+    val length = horizontalDistance(from, to)
+    val steps = kotlin.math.ceil(length / spacing).toInt().coerceAtLeast(1)
+    return (0 until steps).map { i ->
+        val t = i / steps.toFloat()
+        WalkedPoint(run, i, level, from.x + (to.x - from.x) * t, floorY, from.z + (to.z - from.z) * t)
     }
 }
 
