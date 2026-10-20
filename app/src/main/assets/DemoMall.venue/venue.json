@@ -1,0 +1,68 @@
+{
+  "formatVersion": 1,
+  "id": "demo-mall",
+  "name": { "en": "Demo Mall", "ar": "المول التجريبي" },
+  "levels": [
+    { "id": "L0", "name": { "en": "Ground Floor", "ar": "الطابق الأرضي" }, "elevation": 0 },
+    { "id": "L1", "name": { "en": "Level 1", "ar": "الطابق الأول" }, "elevation": 4.5 }
+  ],
+  "nodes": [
+    { "id": "entrance", "level": "L0", "x": 0, "z": 1.5 },
+    { "id": "hall", "level": "L0", "x": 0, "z": 4 },
+    { "id": "west", "level": "L0", "x": -4, "z": 4 },
+    { "id": "east", "level": "L0", "x": 4, "z": 4 },
+    { "id": "restrooms", "level": "L0", "x": -6, "z": 4 },
+    { "id": "shop101", "level": "L0", "x": -4, "z": 7 },
+    { "id": "shop102", "level": "L0", "x": 4, "z": 7 },
+    { "id": "lift-L0", "level": "L0", "x": 6, "z": 4 },
+    { "id": "foodcourt", "level": "L0", "x": 0, "z": 8 },
+    { "id": "escalator-bottom", "level": "L0", "x": 2, "z": 8 },
+
+    { "id": "lift-L1", "level": "L1", "x": 6, "z": 4 },
+    { "id": "l1-east", "level": "L1", "x": 6, "z": 10 },
+    { "id": "escalator-top", "level": "L1", "x": 2, "z": 13 },
+    { "id": "l1-middle", "level": "L1", "x": 2, "z": 10 },
+    { "id": "cinema", "level": "L1", "x": -2, "z": 10 },
+    { "id": "shop201", "level": "L1", "x": 6, "z": 12 }
+  ],
+  "edges": [
+    { "from": "entrance", "to": "hall", "type": "door" },
+    { "from": "hall", "to": "west" },
+    { "from": "hall", "to": "east" },
+    { "from": "west", "to": "restrooms" },
+    { "from": "west", "to": "shop101" },
+    { "from": "east", "to": "shop102" },
+    { "from": "east", "to": "lift-L0" },
+    { "from": "hall", "to": "foodcourt" },
+    { "from": "foodcourt", "to": "escalator-bottom" },
+    { "from": "escalator-bottom", "to": "escalator-top", "type": "escalator", "oneWay": true },
+    { "from": "lift-L0", "to": "lift-L1", "type": "elevator" },
+
+    { "from": "lift-L1", "to": "l1-east" },
+    { "from": "l1-east", "to": "l1-middle" },
+    { "from": "l1-east", "to": "shop201" },
+    { "from": "escalator-top", "to": "l1-middle" },
+    { "from": "l1-middle", "to": "cinema" }
+  ],
+  "pois": [],
+  "markers": [
+    { "id": "sign-entrance", "name": { "en": "Main Entrance sign", "ar": "لافتة المدخل الرئيسي" },
+      "image": "markers/entrance.png", "physicalWidth": 0.2, "level": "L0",
+      "x": 0, "y": 1.4, "z": 0, "facing": 0, "mounting": "wall" },
+    { "id": "sign-lift-L0", "name": { "en": "Lift lobby sign (Ground)" },
+      "image": "markers/lift-l0.png", "physicalWidth": 0.2, "level": "L0",
+      "x": 7, "y": 1.4, "z": 4, "facing": 270, "mounting": "wall" },
+    { "id": "sign-lift-L1", "name": { "en": "Lift lobby sign (Level 1)" },
+      "image": "markers/lift-l1.png", "physicalWidth": 0.2, "level": "L1",
+      "x": 7, "y": 5.9, "z": 4, "facing": 270, "mounting": "wall" },
+    { "id": "sign-foodcourt", "name": { "en": "Food Court floor sticker" },
+      "image": "markers/foodcourt.png", "physicalWidth": 0.3, "level": "L0",
+      "x": 0, "y": 0, "z": 9.5, "facing": 180, "mounting": "floor" }
+  ],
+  "tips": [
+    { "id": "tip-restrooms", "level": "L0", "x": 0, "z": 4, "radius": 1.5,
+      "text": { "en": "Restrooms are 6 m to the left.", "ar": "دورات المياه على بعد ٦ م إلى اليسار." } },
+    { "id": "tip-cinema", "level": "L1", "x": 6, "z": 6, "radius": 2,
+      "text": { "en": "The cinema box office is on this floor." } }
+  ]
+}
