@@ -8,7 +8,7 @@ complete in itself:
 | `venueId` | The venue the coordinates belong to |
 | `destination` | Name, level, x, z, floorY of where the path ends |
 | `walkedPoints` | The points of the walk (grouped by `run`), venue coordinates in meters |
-| `objects` | Objects placed along the path (`isReference` is a leftover of an earlier automatic start star; it is not drawn) |
+| `objects` | Objects placed along the path. `text` is the name shown above the object (for a message, the message itself). `isReference` is a leftover of an earlier automatic start star; it is not drawn |
 | `startMarkerId` | The sign the path was recorded from. Scan the same one for the best accuracy |
 | `alignmentSpreadCm` | How well the sign sightings agreed while recording (smaller is better; over ~5 means a poor alignment) |
 | `driftCorrectedCm` | How much drift re-scanning a sign during the walk corrected (null if none was re-scanned) |

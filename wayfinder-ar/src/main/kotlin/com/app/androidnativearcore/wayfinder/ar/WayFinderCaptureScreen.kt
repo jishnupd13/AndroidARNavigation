@@ -200,7 +200,9 @@ fun WayFinderCaptureScreen(
     var toast by remember { mutableStateOf<Toast?>(null) }
     var naming by remember { mutableStateOf(false) }
     var selectedKind by remember { mutableStateOf(PlacedObjectKind.CUP) } // what the next tap places
-    var messageText by remember { mutableStateOf("") }
+    // The object just placed, whose name the user can type in the box at the bottom (the name floats above it).
+    var namingObjectId by remember { mutableStateOf<String?>(null) }
+    var nameDraft by remember { mutableStateOf("") }
 
     val view = LocalView.current
     DisposableEffect(view) {
@@ -292,10 +294,6 @@ fun WayFinderCaptureScreen(
      * sensible, on the floor along the tapped direction, and the user is told, so a tap is never ignored.
      */
     fun handleTap(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session, x: Float, y: Float) {
-        if (selectedKind == PlacedObjectKind.MESSAGE && messageText.isBlank()) {
-            showToast("Type your message first, then tap where it goes.")
-            return
-        }
         val cameraPosition = Vec3(camera[0], camera[1], camera[2])
         val hit = markerTracker.surfaceAt(frame, session, x, y, MAX_OBJECT_DISTANCE_M)
         val onSurface = hit != null
@@ -319,9 +317,12 @@ fun WayFinderCaptureScreen(
         objectProgress[id] = recorder.progress
         sessionObjects += PlacedObject(
             id = id, kind = selectedKind, level = "", x = spot.x, y = spot.y, z = spot.z, yawDegrees = yaw,
-            text = if (selectedKind == PlacedObjectKind.MESSAGE) messageText.trim() else "",
+            // A message needs words to show; anything else starts without a name until the user types one.
+            text = if (selectedKind == PlacedObjectKind.MESSAGE) "Hello!" else "",
             createdAtMillis = System.currentTimeMillis(), scale = objectScaleFor(distance),
         )
+        namingObjectId = id
+        nameDraft = if (selectedKind == PlacedObjectKind.MESSAGE) "Hello!" else ""
         showToast(
             if (onSurface) "${selectedKind.label} added, %.1f m away".format(distance)
             else "${selectedKind.label} added %.1f m away (no surface found there, so it is on the floor)".format(distance),
@@ -502,11 +503,17 @@ fun WayFinderCaptureScreen(
         ) {
             ToastHost(toast)
             if (lockedIn) {
-                if (selectedKind == PlacedObjectKind.MESSAGE) {
-                    OutlinedTextField(
-                        value = messageText, onValueChange = { messageText = it.take(40) }, singleLine = true,
-                        label = { Text("Message, e.g. Turn left here") },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).background(Color(0xE6FFFFFF), RoundedCornerShape(4.dp)),
+                namingObjectId?.let { id ->
+                    val isMessage = sessionObjects.firstOrNull { it.id == id }?.kind == PlacedObjectKind.MESSAGE
+                    NameBox(
+                        value = nameDraft,
+                        hint = if (isMessage) "Your message" else "Name this object (optional)",
+                        onChange = { text ->
+                            nameDraft = text.take(30)
+                            val index = sessionObjects.indexOfFirst { it.id == id }
+                            if (index >= 0) sessionObjects[index] = sessionObjects[index].copy(text = nameDraft.trim())
+                        },
+                        onDone = { namingObjectId = null },
                     )
                 }
                 ObjectBar(selected = selectedKind, onSelect = { selectedKind = it })
@@ -518,6 +525,7 @@ fun WayFinderCaptureScreen(
                             if (inSession >= 0) {
                                 val removed = sessionObjects.removeAt(inSession)
                                 anchors.remove(removed.id)?.detach()
+                                if (namingObjectId == removed.id) namingObjectId = null
                             } else {
                                 val committed = committedObjects.indexOfLast { !it.isReference }
                                 if (committed >= 0) committedObjects.removeAt(committed)
@@ -609,5 +617,21 @@ private fun ObjectBar(selected: PlacedObjectKind, onSelect: (PlacedObjectKind) -
                     .padding(horizontal = 14.dp, vertical = 9.dp),
             )
         }
+    }
+}
+
+/** Where the user types the name of the object they just placed. It sits above the object bar, not in a pop-up. */
+@Composable
+private fun NameBox(value: String, hint: String, onChange: (String) -> Unit, onDone: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp).background(Color(0xE6FFFFFF), RoundedCornerShape(10.dp)).padding(start = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = value, onValueChange = onChange, singleLine = true,
+            placeholder = { Text(hint) },
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onDone) { Text("OK") }
     }
 }
