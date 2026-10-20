@@ -561,7 +561,7 @@ fun WayFinderCaptureScreen(
             text = {
                 OutlinedTextField(
                     value = name, onValueChange = { name = it }, singleLine = true,
-                    label = { Text("e.g. Sofa") },
+                    label = { Text("Destination") },
                 )
             },
             confirmButton = {
