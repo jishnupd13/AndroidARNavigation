@@ -66,7 +66,7 @@ fun ARSceneScope.RouteScene(
 
     Node(position = rootPosition, rotation = rootRotation) {
         // Floor arrows along every route segment on this level, with a brightness wave running along them.
-        ArrowField(remember(route, level) { arrows(route, level) }, floor)
+        ArrowField(remember(route, level) { arrows(route, level) })
 
         // Level-change signs.
         for (maneuver in route.maneuvers) {
@@ -115,7 +115,7 @@ private fun arrowAlpha(seconds: Float): Float {
 }
 
 @Composable
-private fun SceneScope.ArrowField(arrows: List<ArrowPlacement>, floor: Float) {
+private fun SceneScope.ArrowField(arrows: List<ArrowPlacement>) {
     // One material per arrow so each can have its own opacity.
     val materials = remember(arrows, materialLoader) {
         arrows.map { materialLoader.createColorInstance(RouteStyle.arrow.copy(alpha = RouteStyle.ARROW_MIN_ALPHA)) }
@@ -131,7 +131,7 @@ private fun SceneScope.ArrowField(arrows: List<ArrowPlacement>, floor: Float) {
         }
     }
     arrows.forEachIndexed { index, arrow ->
-        Node(position = Position(arrow.x, floor + 0.02f, arrow.z), rotation = Rotation(y = arrow.yawDegrees)) {
+        Node(position = Position(arrow.x, arrow.y + 0.02f, arrow.z), rotation = Rotation(y = arrow.yawDegrees)) {
             // Lay the chevron flat (its +y becomes -z); the parent turns it along the segment.
             ShapeNode(
                 polygonPath = RouteStyle.chevron,
@@ -183,7 +183,7 @@ private fun SceneScope.Badge(
     )
 }
 
-private class ArrowPlacement(val x: Float, val z: Float, val yawDegrees: Float)
+private class ArrowPlacement(val x: Float, val y: Float, val z: Float, val yawDegrees: Float)
 
 private fun arrows(route: Route, level: String): List<ArrowPlacement> {
     val result = mutableListOf<ArrowPlacement>()
@@ -198,7 +198,8 @@ private fun arrows(route: Route, level: String): List<ArrowPlacement> {
         val yaw = Math.toDegrees(atan2(-direction.x, -direction.y).toDouble()).toFloat() // rotates -z onto the segment
         var distance = RouteStyle.ARROW_SPACING / 2
         while (distance < length) {
-            result += ArrowPlacement(start.x + direction.x * distance, start.z + direction.y * distance, yaw)
+            val t = distance / length
+            result += ArrowPlacement(start.x + direction.x * distance, start.y + (end.y - start.y) * t, start.z + direction.y * distance, yaw)
             distance += RouteStyle.ARROW_SPACING
         }
     }

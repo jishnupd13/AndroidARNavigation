@@ -78,6 +78,12 @@ data class Venue(
         /** The network node routes to this POI end at. */
         val node: String,
         val description: LocalizedText? = null,
+        /**
+         * Height of the real floor at this POI, in venue coordinates. When null, the elevation of its level is used.
+         * Destinations a user records set it from the floor ARCore detected, so the pin stands on the real floor
+         * even if the sign isn't mounted at exactly the height the venue data assumes.
+         */
+        val elevation: Float? = null,
     )
 
     @Serializable
@@ -133,7 +139,7 @@ data class Venue(
     /** Position of a node in venue coordinates (on its level's floor). */
     fun position(of: Node): Vec3 = Vec3(of.x, level(of.level)?.elevation ?: 0f, of.z)
 
-    fun position(of: POI): Vec3 = Vec3(of.x, level(of.level)?.elevation ?: 0f, of.z)
+    fun position(of: POI): Vec3 = Vec3(of.x, of.elevation ?: level(of.level)?.elevation ?: 0f, of.z)
 
     /** The level whose floor best matches a device held at roughly chest/eye height. */
     fun level(forDeviceHeight: Float, typicalDeviceHeightAboveFloor: Float = 1.3f): Level? {

@@ -70,6 +70,8 @@ data class CapturedDestination(
     val path: List<WalkedPoint>,
     /** Objects the user placed along the path; [PlacedObject.destinationId] is still empty. */
     val objects: List<PlacedObject> = emptyList(),
+    /** Height of the real floor under the destination, in venue coordinates (null if unknown). */
+    val floorY: Float? = null,
 )
 
 /** Shortest recorded walk (meters) that is worth saving as a route. */
@@ -162,6 +164,8 @@ fun WayFinderCaptureScreen(
     var lostSince by remember { mutableStateOf<Long?>(null) }
     val referenceAdded = remember(pkg) { BooleanArray(1) } // the automatic reference object exists
     val recent = remember(pkg) { ArrayDeque<Vec3>() }       // the phone's latest positions, to tell when it is held steady
+    val floorSamples = remember(pkg) { ArrayDeque<Float>() } // recent floor heights (session frame) from detected planes
+    val frameCounter = remember { IntArray(1) }
 
     // --- What the user sees (only things that change rarely) ---
     var lockedIn by remember { mutableStateOf(false) }
@@ -172,6 +176,7 @@ fun WayFinderCaptureScreen(
     var steady by remember { mutableStateOf(false) }
     var pendingDestination by remember { mutableStateOf<Vec3?>(null) } // session position chosen when Save was tapped
     var pendingLevel by remember { mutableStateOf("") }
+    var pendingFloorSession by remember { mutableStateOf(0f) }
     var trackingMessage by remember { mutableStateOf<String?>("Starting the camera… move the phone slowly.") }
     var toast by remember { mutableStateOf<Toast?>(null) }
     var naming by remember { mutableStateOf(false) }
@@ -192,6 +197,13 @@ fun WayFinderCaptureScreen(
     fun showToast(message: String, durationMs: Long = 2_000) {
         toast = Toast((toast?.id ?: 0) + 1, message, durationMs)
     }
+
+    /**
+     * The real floor's height in the session frame: the middle of the recent plane-based estimates, or, until ARCore
+     * has found the floor, the phone's height minus a typical 1.4 m (what the iOS prototype does too).
+     */
+    fun floorSessionY(): Float =
+        floorSamples.sorted().let { if (it.isEmpty()) camera[1] - PHONE_HEIGHT_M else it[it.size / 2] }
 
     fun yawDegrees(m: Mat4) = Math.toDegrees(AlignmentFilter.yaw(m).toDouble()).toFloat()
 
@@ -224,12 +236,12 @@ fun WayFinderCaptureScreen(
         val venueFromSession = filter.alignment.inverse()
         val raw = recorder.points
         if (raw.isNotEmpty()) {
-            val converted = raw.toWalkedPoints(venue, venueFromSession, marker.level)
+            val converted = raw.toWalkedPoints(venue, venueFromSession, marker.level, floorSessionY())
             if (committedPath.isEmpty()) {
                 // Start the path at the sign itself, then straight to where the user first stood: they just looked at
                 // the sign, so the way between is clear. This lets routes begin at the sign later.
                 val first = converted.first()
-                val floor = venue.level(first.level)?.elevation ?: 0f
+                val floor = first.y
                 val lead = straightWalk(Vec3(marker.x, floor, marker.z), Vec3(first.x, floor, first.z), first.run, first.level, floor)
                     .let { points -> points.mapIndexed { i, p -> p.copy(sequence = i - points.size) } }
                 committedPath += lead
@@ -298,6 +310,7 @@ fun WayFinderCaptureScreen(
                         lockProgress = 0
                         user.valid = false
                         recent.clear()
+                        floorSamples.clear()
                     }
                 } else {
                     lostSince = null
@@ -327,6 +340,11 @@ fun WayFinderCaptureScreen(
                     user.level = level; user.venueX = inVenue.x; user.venueZ = inVenue.z
                     venue.level(level)?.name?.resolved()?.let { if (it != levelName) levelName = it }
 
+                    // Sample the real floor a few times a second; the middle of the recent samples is used.
+                    if (frameCounter[0]++ % 8 == 0) {
+                        markerTracker.floorHeightBelow(session, cameraSession)?.let { floorSamples.addLast(it) }
+                        while (floorSamples.size > 15) floorSamples.removeFirst()
+                    }
                     recorder.record(cameraSession)
                     recent.addLast(cameraSession)
                     while (recent.size > STEADY_FRAMES) recent.removeFirst()
@@ -337,7 +355,7 @@ fun WayFinderCaptureScreen(
                     if (!referenceAdded[0]) {
                         // The reference point: an object on the floor where the user scanned from.
                         referenceAdded[0] = true
-                        val spot = Vec3(cameraSession.x, cameraSession.y - PHONE_HEIGHT_M, cameraSession.z)
+                        val spot = Vec3(cameraSession.x, floorSessionY(), cameraSession.z)
                         val id = "reference-" + java.util.UUID.randomUUID()
                         anchors[id] = session.createAnchor(Pose(floatArrayOf(spot.x, spot.y, spot.z), floatArrayOf(0f, 0f, 0f, 1f)))
                         sessionObjects += PlacedObject(
@@ -449,6 +467,7 @@ fun WayFinderCaptureScreen(
                             // hand sway can't move it. It is fixed now, before the name is typed.
                             pendingDestination = averageOf(recent) ?: user.session
                             pendingLevel = user.level
+                            pendingFloorSession = floorSessionY()
                             naming = true
                         },
                     ) {
@@ -480,11 +499,15 @@ fun WayFinderCaptureScreen(
                         val spot = pendingDestination!!
                         recorder.recordAnchor(spot)
                         refreshFromAnchors()
-                        val here = filter.alignment.inverse().transformPoint(spot)
+                        val venueFromSession = filter.alignment.inverse()
+                        val here = venueFromSession.transformPoint(spot)
+                        // The real floor under the destination, in venue coordinates, so the pin stands on it.
+                        val floorY = venueFromSession.transformPoint(Vec3(spot.x, pendingFloorSession, spot.z)).y
                         commit()
                         onSave(
                             CapturedDestination(
                                 name.trim(), pendingLevel, here.x, here.z, committedPath.toList(), committedObjects.toList(),
+                                floorY = floorY,
                             ),
                         )
                     },

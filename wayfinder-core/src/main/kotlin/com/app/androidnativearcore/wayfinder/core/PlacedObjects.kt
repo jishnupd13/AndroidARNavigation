@@ -1,11 +1,8 @@
 package com.app.androidnativearcore.wayfinder.core
 
-import java.io.File
 import kotlin.math.max
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.builtins.ListSerializer
-import kotlinx.serialization.json.Json
 
 /** The kinds of 3D object a user can drop along a path while recording it. */
 @Serializable
@@ -82,31 +79,4 @@ fun PlacedObject.toVenue(venue: Venue, venueFromSession: Mat4, alignmentYawDegre
     val v = venueFromSession.transformPoint(position)
     val level = venue.level(forDeviceHeight = v.y + 1.3f)?.id ?: fallbackLevel
     return copy(level = level, x = v.x, y = v.y, z = v.z, yawDegrees = yawDegrees - alignmentYawDegrees)
-}
-
-/** Keeps every placed object in a JSON file, so they come back after a restart. */
-class PlacedObjectStore(private val file: File) {
-    private val json = Json { ignoreUnknownKeys = true }
-    private val serializer = ListSerializer(PlacedObject.serializer())
-
-    fun load(): List<PlacedObject> = runCatching {
-        if (file.exists()) json.decodeFromString(serializer, file.readText()) else emptyList()
-    }.getOrDefault(emptyList())
-
-    fun addAll(objects: List<PlacedObject>): List<PlacedObject> = save(load() + objects)
-
-    /** Removes everything that belongs to a deleted destination. */
-    fun removeForDestination(destinationId: String): List<PlacedObject> =
-        save(load().filterNot { it.destinationId == destinationId })
-
-    private fun save(list: List<PlacedObject>): List<PlacedObject> {
-        file.parentFile?.mkdirs()
-        val temp = File(file.path + ".tmp")
-        temp.writeText(json.encodeToString(serializer, list))
-        if (!temp.renameTo(file)) {
-            file.delete()
-            check(temp.renameTo(file)) { "Can't save objects to ${file.path}" }
-        }
-        return list
-    }
 }

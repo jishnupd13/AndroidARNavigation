@@ -52,13 +52,12 @@ import com.app.androidnativearcore.wayfinder.ar.WayFinderCaptureScreen
 import com.app.androidnativearcore.wayfinder.ar.WayFinderNavigationListener
 import com.app.androidnativearcore.wayfinder.ar.WayFinderNavigationScreen
 import com.app.androidnativearcore.wayfinder.core.CustomDestination
-import com.app.androidnativearcore.wayfinder.core.CustomDestinationStore
+import com.app.androidnativearcore.wayfinder.core.ArPath
+import com.app.androidnativearcore.wayfinder.core.ArPathStore
 import com.app.androidnativearcore.wayfinder.core.Route
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
-import com.app.androidnativearcore.wayfinder.core.PlacedObjectStore
-import com.app.androidnativearcore.wayfinder.core.WalkedPathStore
 import com.app.androidnativearcore.wayfinder.core.withCustomDestinations
 import com.google.ar.core.ArCoreApk
 import java.io.File
@@ -114,15 +113,11 @@ fun WayFinderDemoApp() {
 @Composable
 private fun WayFinderHost(basePackage: VenuePackage) {
     val context = LocalContext.current
-    // Destinations the user added are saved on the phone and show up as ordinary POIs.
-    val store = remember { CustomDestinationStore(File(context.filesDir, "custom_destinations.json")) }
-    var customDestinations by remember { mutableStateOf(store.load()) }
-    // The walks recorded while adding destinations; routes to those destinations follow them.
-    val walkStore = remember { WalkedPathStore(File(context.filesDir, "walked_path.json")) }
-    var walkedPoints by remember { mutableStateOf(walkStore.load()) }
-    // Objects placed along the walked paths, shown when navigating to their destination.
-    val objectStore = remember { PlacedObjectStore(File(context.filesDir, "placed_objects.json")) }
-    var placedObjects by remember { mutableStateOf(objectStore.load()) }
+    // Every path the user recorded is its own JSON file in `paths/`: the destination, the walk to it and the objects
+    // along it. Destinations show up in the list as ordinary POIs.
+    val store = remember { ArPathStore(File(context.filesDir, "paths")) }
+    var paths by remember { mutableStateOf(store.load(basePackage.venue.id)) }
+    val customDestinations = paths.map { it.destination }
     val pkg = remember(basePackage, customDestinations) {
         basePackage.withVenue(basePackage.venue.withCustomDestinations(customDestinations))
     }
@@ -137,24 +132,27 @@ private fun WayFinderHost(basePackage: VenuePackage) {
             onNavigate = { screen = Screen.Navigate(it, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST) },
             onOpenSigns = { screen = Screen.Signs },
             onAddDestination = { screen = Screen.Capture },
-            onDeleteDestination = {
-                customDestinations = store.remove(it.id)
-                placedObjects = objectStore.removeForDestination(it.id)
+            onDeleteDestination = { // deletes that path's file: its walk and objects go with it
+                store.delete(it.id)
+                paths = store.load(basePackage.venue.id)
             },
         )
         Screen.Capture -> WayFinderCaptureScreen(
             pkg = pkg,
             onSave = { captured ->
-                walkedPoints = walkStore.addAll(captured.path)
-                val destinationId = "custom-" + UUID.randomUUID()
-                placedObjects = objectStore.addAll(captured.objects.map { it.copy(destinationId = destinationId) })
-                customDestinations = store.add(
-                    CustomDestination(
-                        id = destinationId,
-                        name = captured.name, level = captured.level, x = captured.x, z = captured.z,
-                        createdAtMillis = System.currentTimeMillis(),
+                store.save(
+                    ArPath(
+                        venueId = basePackage.venue.id,
+                        destination = CustomDestination(
+                            id = "custom-" + UUID.randomUUID(),
+                            name = captured.name, level = captured.level, x = captured.x, z = captured.z,
+                            createdAtMillis = System.currentTimeMillis(), floorY = captured.floorY,
+                        ),
+                        walkedPoints = captured.path,
+                        objects = captured.objects,
                     ),
                 )
+                paths = store.load(basePackage.venue.id)
                 screen = Screen.List
             },
             onCancel = { screen = Screen.List },
@@ -185,8 +183,9 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 destinationId = current.poi.id,
                 profile = current.profile,
                 listener = listener,
-                walkedPoints = walkedPoints,
-                placedObjects = placedObjects,
+                // Routes follow the destination's own path, and only its objects are shown.
+                walkedPoints = paths.firstOrNull { it.destination.id == current.poi.id }?.walkedPoints.orEmpty(),
+                placedObjects = paths.firstOrNull { it.destination.id == current.poi.id }?.objects.orEmpty(),
                 debug = true,
             )
         }

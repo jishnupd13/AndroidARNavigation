@@ -92,6 +92,26 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
     }
 
     /**
+     * Height of the real floor under the user in the session frame, from the horizontal planes ARCore has detected:
+     * the lowest upward-facing plane 0.8–2.3 m below the camera and within 6 m of it (tables are higher; the
+     * lowest remaining surface is the floor). Null when no such plane is known yet. Needs [configure] with
+     * `aiming = true`.
+     */
+    fun floorHeightBelow(session: Session, camera: Vec3): Float? {
+        var lowest: Float? = null
+        for (plane in session.getAllTrackables(Plane::class.java)) {
+            if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) continue
+            if (plane.type != Plane.Type.HORIZONTAL_UPWARD_FACING) continue
+            val center = plane.centerPose
+            val y = center.ty()
+            if (y > camera.y - 0.8f || y < camera.y - 2.3f) continue
+            if (kotlin.math.hypot((center.tx() - camera.x).toDouble(), (center.tz() - camera.z).toDouble()) > 6.0) continue
+            if (lowest == null || y < lowest) lowest = y
+        }
+        return lowest
+    }
+
+    /**
      * The surface at screen position ([xPx], [yPx]) (e.g. where the user tapped), in session coordinates, with an
      * ARCore anchor that keeps it glued to the real world, or null if ARCore knows no surface there.
      *

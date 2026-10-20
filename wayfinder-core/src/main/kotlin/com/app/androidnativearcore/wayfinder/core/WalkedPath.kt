@@ -1,14 +1,11 @@
 package com.app.androidnativearcore.wayfinder.core
 
-import java.io.File
 import java.util.PriorityQueue
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.builtins.ListSerializer
-import kotlinx.serialization.json.Json
 
 /**
  * One recorded point of a walked path, on the floor, in venue coordinates.
@@ -23,6 +20,8 @@ data class WalkedPoint(
     val x: Float,
     val y: Float,
     val z: Float,
+    /** The saved destination this walk was recorded for ("" in data saved before paths were linked to destinations). */
+    val destinationId: String = "",
 ) {
     val position: Vec3 get() = Vec3(x, y, z)
 }
@@ -59,7 +58,7 @@ class WalkedPathRouter(
     /** Maximum distance for linking points of different runs or non-consecutive points. */
     var crossLinkDistance: Float = 0.6f,
     /** Points more than this apart vertically are on different floors (or stairs) and aren't cross-linked. */
-    var maxHeightDifference: Float = 0.4f,
+    var maxHeightDifference: Float = 0.8f,
     /**
      * How close the user must be to a walked point for a route to start. A little more generous than the iOS
      * prototype's 1 m, because here the user usually starts from the sign they just scanned, at up to a few meters.
@@ -287,13 +286,21 @@ class SessionPathRecorder(
 
 /**
  * Converts a session-frame walk to venue coordinates with [venueFromSession] (the inverse of the final
- * alignment). Each point goes on the level its height belongs to, at that level's floor height.
+ * alignment). Each point goes on the level its height belongs to, at the real floor height when it is known.
  */
-fun List<RawWalkPoint>.toWalkedPoints(venue: Venue, venueFromSession: Mat4, fallbackLevel: String): List<WalkedPoint> =
+fun List<RawWalkPoint>.toWalkedPoints(
+    venue: Venue,
+    venueFromSession: Mat4,
+    fallbackLevel: String,
+    /** Height of the real floor in the session frame, if known; otherwise the level's elevation is used. */
+    floorSessionY: Float? = null,
+): List<WalkedPoint> =
     map { raw ->
         val v = venueFromSession.transformPoint(raw.position)
         val level = venue.level(forDeviceHeight = v.y)?.id ?: fallbackLevel
-        WalkedPoint(raw.run, raw.sequence, level, v.x, venue.level(level)?.elevation ?: 0f, v.z)
+        val floorY = floorSessionY?.let { venueFromSession.transformPoint(Vec3(raw.position.x, it, raw.position.z)).y }
+            ?: venue.level(level)?.elevation ?: 0f
+        WalkedPoint(raw.run, raw.sequence, level, v.x, floorY, v.z)
     }
 
 /**
@@ -306,32 +313,5 @@ fun straightWalk(from: Vec3, to: Vec3, run: String, level: String, floorY: Float
     return (0 until steps).map { i ->
         val t = i / steps.toFloat()
         WalkedPoint(run, i, level, from.x + (to.x - from.x) * t, floorY, from.z + (to.z - from.z) * t)
-    }
-}
-
-/** Keeps every recorded walk in a JSON file, so routes to saved destinations survive restarts. */
-class WalkedPathStore(private val file: File) {
-    private val json = Json { ignoreUnknownKeys = true }
-    private val serializer = ListSerializer(WalkedPoint.serializer())
-
-    fun load(): List<WalkedPoint> = runCatching {
-        if (file.exists()) json.decodeFromString(serializer, file.readText()) else emptyList()
-    }.getOrDefault(emptyList())
-
-    fun addAll(points: List<WalkedPoint>): List<WalkedPoint> = save(load() + points)
-
-    fun clear() {
-        file.delete()
-    }
-
-    private fun save(list: List<WalkedPoint>): List<WalkedPoint> {
-        file.parentFile?.mkdirs()
-        val temp = File(file.path + ".tmp")
-        temp.writeText(json.encodeToString(serializer, list))
-        if (!temp.renameTo(file)) {
-            file.delete()
-            check(temp.renameTo(file)) { "Can't save the walked path to ${file.path}" }
-        }
-        return list
     }
 }

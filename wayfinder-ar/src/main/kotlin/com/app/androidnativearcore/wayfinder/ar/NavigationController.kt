@@ -266,7 +266,7 @@ class NavigationController(
             val where = venue.level(destination.level)?.let { resolve(it.name) } ?: destination.level
             throw RoutingError.Other("This destination was saved on $where. Go there first.")
         }
-        val floor = venue.level(level)?.elevation ?: 0f
+        val floor = destination.elevation ?: venue.level(level)?.elevation ?: 0f
         val start = Vec3(position.x, floor, position.z)
         val goal = Vec3(destination.x, floor, destination.z)
         val points = walkedPoints.filter { it.level == level }

@@ -351,6 +351,16 @@ class CustomDestinationTest {
     }
 
     @Test
+    fun destinationPinUsesTheRecordedFloorHeight() {
+        val venue = makeVenue().withCustomDestinations(listOf(
+            destination.copy(floorY = 0.35f),
+            destination.copy(id = "c-old", name = "Old"), // saved before floor heights were recorded
+        ))
+        assertNear(0.35f, venue.position(venue.poi("c1")!!).y)
+        assertNear(0f, venue.position(venue.poi("c-old")!!).y) // falls back to the level's elevation
+    }
+
+    @Test
     fun invalidOrDuplicateEntriesAreSkipped() {
         val venue = makeVenue().withCustomDestinations(listOf(
             destination.copy(id = "bad-level", level = "L9"),
@@ -359,35 +369,6 @@ class CustomDestinationTest {
         ))
         assertEquals(setOf("shop", "c1"), venue.pois.map { it.id }.toSet())
         assertEquals("Shop 101", venue.poi("shop")?.name?.resolved(listOf("en")))
-    }
-
-    @Test
-    fun storePersistsAddsAndRemoves() {
-        val dir = Files.createTempDirectory("store").toFile()
-        try {
-            val file = File(dir, "nested/destinations.json")
-            val store = CustomDestinationStore(file)
-            assertEquals(emptyList<CustomDestination>(), store.load())
-            store.add(destination)
-            store.add(destination.copy(id = "c2", name = "Second"))
-            // A new store instance reads what the first one wrote.
-            assertEquals(listOf("c1", "c2"), CustomDestinationStore(file).load().map { it.id })
-            store.remove("c1")
-            assertEquals(listOf("c2"), CustomDestinationStore(file).load().map { it.id })
-        } finally {
-            dir.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun corruptStoreFileLoadsAsEmpty() {
-        val dir = Files.createTempDirectory("store").toFile()
-        try {
-            val file = File(dir, "destinations.json").apply { writeText("{not json") }
-            assertEquals(emptyList<CustomDestination>(), CustomDestinationStore(file).load())
-        } finally {
-            dir.deleteRecursively()
-        }
     }
 }
 
@@ -509,26 +490,25 @@ class WalkedPathTest {
     }
 
     @Test
+    fun walkedPointsStandOnTheRealFloorWhenItIsKnown() {
+        val venue = makeVenue()
+        // The sign is mounted lower than the venue data assumes, so the real floor is 0.35 m above venue y = 0.
+        val alignment = Mat4.yaw(0f, Vec3(5f, 0f, 5f))
+        val floorInSession = alignment.transformPoint(Vec3(0f, 0.35f, 0f)).y
+        val raw = (0..3).map { RawWalkPoint("r", it, alignment.transformPoint(Vec3(0f, 1.7f, it.toFloat()))) }
+        val onRealFloor = raw.toWalkedPoints(venue, alignment.inverse(), "L0", floorSessionY = floorInSession)
+        onRealFloor.forEach { assertNear(0.35f, it.y, 1e-3f) }
+        // Without a detected floor the level's nominal elevation is used, as before.
+        raw.toWalkedPoints(venue, alignment.inverse(), "L0").forEach { assertNear(0f, it.y, 1e-6f) }
+    }
+
+    @Test
     fun straightWalkStartsAtTheSign() {
         val points = straightWalk(Vec3(0f, 0f, 0f), Vec3(0f, 0f, 2f), "s", "L0", 0f)
         assertEquals(4, points.size) // 0, 0.5, 1.0, 1.5 (the end point itself is left to the recorder)
         assertNear(0f, points.first().z); assertNear(1.5f, points.last().z)
     }
 
-    @Test
-    fun walkedPathStorePersists() {
-        val dir = Files.createTempDirectory("walk").toFile()
-        try {
-            val file = File(dir, "walked.json")
-            WalkedPathStore(file).addAll(straight("a", 2f))
-            WalkedPathStore(file).addAll(straight("b", 1f))
-            assertEquals(5 + 3, WalkedPathStore(file).load().size)
-            WalkedPathStore(file).clear()
-            assertEquals(0, WalkedPathStore(file).load().size)
-        } finally {
-            dir.deleteRecursively()
-        }
-    }
 }
 
 class AlignmentFilterTest {
@@ -634,51 +614,6 @@ class PlacedObjectTest {
         assertTrue(q.x.isFinite() && q.z.isFinite())
     }
 
-    @Test
-    fun storePersistsAndRemovesWithTheDestination() {
-        val dir = Files.createTempDirectory("objects").toFile()
-        try {
-            val file = File(dir, "objects.json")
-            val store = PlacedObjectStore(file)
-            store.addAll(listOf(obj("a", "d1"), obj("b", "d2").copy(kind = PlacedObjectKind.MESSAGE, text = "Turn here!")))
-            val loaded = PlacedObjectStore(file).load()
-            assertEquals(listOf("a", "b"), loaded.map { it.id })
-            assertEquals("Turn here!", loaded[1].text)
-            assertEquals(PlacedObjectKind.MESSAGE, loaded[1].kind)
-            store.removeForDestination("d1")
-            assertEquals(listOf("b"), PlacedObjectStore(file).load().map { it.id })
-        } finally {
-            dir.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun referenceFlagSurvivesSavingAndDefaultsToOff() {
-        val dir = Files.createTempDirectory("objects").toFile()
-        try {
-            val file = File(dir, "objects.json")
-            PlacedObjectStore(file).addAll(listOf(obj("start", "d1").copy(isReference = true), obj("other", "d1")))
-            val loaded = PlacedObjectStore(file).load()
-            assertTrue(loaded.first { it.id == "start" }.isReference)
-            assertFalse(loaded.first { it.id == "other" }.isReference)
-            // Files written before the flag existed still load, with the flag off.
-            file.writeText("""[{"id":"old","kind":"cup","level":"L0","x":1,"y":0,"z":2}]""")
-            assertFalse(PlacedObjectStore(file).load().single().isReference)
-        } finally {
-            dir.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun corruptFileLoadsAsEmpty() {
-        val dir = Files.createTempDirectory("objects").toFile()
-        try {
-            val file = File(dir, "objects.json").apply { writeText("[oops") }
-            assertEquals(emptyList<PlacedObject>(), PlacedObjectStore(file).load())
-        } finally {
-            dir.deleteRecursively()
-        }
-    }
 }
 
 class ObjectSpreadTest {
@@ -717,5 +652,153 @@ class ObjectSpreadTest {
         assertNear(2f, converted.x, 1e-3f); assertNear(0.7f, converted.y, 1e-3f); assertNear(3f, converted.z, 1e-3f)
         assertNear(30f, converted.yawDegrees) // 120° in the session = 30° relative to the venue
         assertEquals("L0", converted.level)
+    }
+}
+
+class ArPathStoreTest {
+    private val json = Json { ignoreUnknownKeys = true }
+    private fun destination(id: String, name: String = "Dest $id", x: Float = 1f, z: Float = 2f) =
+        CustomDestination(id, name, "L0", x, z, createdAtMillis = 1L, floorY = 0.3f)
+    private fun point(run: String, seq: Int, x: Float, z: Float) = WalkedPoint(run, seq, "L0", x, 0f, z)
+    private fun obj(id: String, kind: PlacedObjectKind = PlacedObjectKind.CUP, reference: Boolean = false) =
+        PlacedObject(id, kind, "L0", 1f, 0.7f, 2f, text = if (kind == PlacedObjectKind.MESSAGE) "Turn here!" else "", isReference = reference)
+    private fun path(id: String, name: String = "Dest $id", venue: String = "v") = ArPath(
+        venueId = venue, destination = destination(id, name),
+        walkedPoints = listOf(point("r-$id", 0, 0f, 0f), point("r-$id", 1, 1f, 2f)),
+        objects = listOf(obj("o-$id", PlacedObjectKind.STAR, reference = true), obj("n-$id", PlacedObjectKind.MESSAGE)),
+    )
+
+    /** A fresh `paths` directory inside an app-files-like parent directory. */
+    private fun withStore(block: (store: ArPathStore, paths: File, parent: File) -> Unit) {
+        val parent = Files.createTempDirectory("arpaths").toFile()
+        try {
+            val paths = File(parent, "paths")
+            block(ArPathStore(paths), paths, parent)
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun eachPathGetsItsOwnFileNamedAfterItsDestination() = withStore { store, paths, _ ->
+        store.save(path("a", "Gaming Room"))
+        store.save(path("b", "E4"))
+        assertEquals(listOf("e4.json", "gaming-room.json"), paths.list()!!.sorted())
+
+        val loaded = store.load("v")
+        assertEquals(setOf("Gaming Room", "E4"), loaded.map { it.destination.name }.toSet())
+        val room = loaded.first { it.destination.id == "a" }
+        assertEquals(2, room.walkedPoints.size)
+        assertTrue(room.walkedPoints.all { it.destinationId == "a" })
+        assertTrue(room.objects.all { it.destinationId == "a" })
+        assertTrue(room.objects.first { it.id == "o-a" }.isReference)
+        assertEquals("Turn here!", room.objects.first { it.id == "n-a" }.text)
+        assertEquals(0.3f, room.destination.floorY!!, 1e-6f)
+    }
+
+    @Test
+    fun sameNameGetsANumberedFile() = withStore { store, paths, _ ->
+        store.save(path("a", "Sofa"))
+        store.save(path("b", "Sofa"))
+        assertEquals(listOf("sofa-2.json", "sofa.json"), paths.list()!!.sorted())
+        assertEquals("sofa", ArPathStore.slugOf("  Sofa!! "))
+        assertEquals("path", ArPathStore.slugOf("???"))
+    }
+
+    @Test
+    fun savingAgainReplacesTheSameFile() = withStore { store, paths, _ ->
+        store.save(path("a", "Sofa"))
+        store.save(path("a", "Sofa").copy(objects = emptyList()))
+        assertEquals(listOf("sofa.json"), paths.list()!!.toList())
+        assertEquals(0, store.load("v").single().objects.size)
+    }
+
+    @Test
+    fun deletingRemovesOnlyThatPathsFile() = withStore { store, paths, _ ->
+        store.save(path("a", "One"))
+        store.save(path("b", "Two"))
+        assertTrue(store.delete("a"))
+        assertFalse(store.delete("a"))
+        assertEquals(listOf("two.json"), paths.list()!!.toList())
+        assertEquals(listOf("b"), store.load("v").map { it.destination.id })
+    }
+
+    @Test
+    fun aDamagedFileIsSkippedAndNeverTouched() = withStore { store, paths, _ ->
+        store.save(path("a", "Good"))
+        val bad = File(paths, "bad.json").apply { writeText("{not json") }
+        assertEquals(listOf("a"), store.load("v").map { it.destination.id })
+        // Saving more paths leaves the damaged file exactly as it was.
+        store.save(path("b", "Also good"))
+        assertEquals("{not json", bad.readText())
+        assertEquals(setOf("a", "b"), store.load("v").map { it.destination.id }.toSet())
+    }
+
+    @Test
+    fun onlyThePathsOfTheCurrentVenueAreLoaded() = withStore { store, _, _ ->
+        store.save(path("a", "Here", venue = "mall"))
+        store.save(path("b", "Elsewhere", venue = "museum"))
+        store.save(path("c", "Very old", venue = "")) // saved before venues were recorded
+        assertEquals(setOf("a", "c"), store.load("mall").map { it.destination.id }.toSet())
+        assertEquals(setOf("b", "c"), store.load("museum").map { it.destination.id }.toSet())
+    }
+
+    @Test
+    fun splitsTheSingleFileIntoOneFilePerPathAndKeepsABackup() = withStore { store, paths, parent ->
+        val data = ArData(
+            destinations = listOf(destination("a", "Gaming Room", 1f, 2f), destination("b", "E4", 5f, 5f)),
+            walkedPoints = listOf(
+                point("ra", 0, 0f, 0f).copy(destinationId = "a"), point("ra", 1, 1f, 2f).copy(destinationId = "a"),
+                point("rb", 0, 0f, 0f).copy(destinationId = "b"),
+                point("stray", 0, 9f, 9f), // belongs to no destination
+            ),
+            objects = listOf(obj("o1").copy(destinationId = "a"), obj("o2").copy(destinationId = "b")),
+        )
+        File(parent, "ar_data.json").writeText(json.encodeToString(ArData.serializer(), data))
+
+        val loaded = store.load("mall")
+        assertEquals(setOf("e4.json", "gaming-room.json"), paths.list()!!.toSet())
+        val room = loaded.first { it.destination.id == "a" }
+        assertEquals(2, room.walkedPoints.size)
+        assertEquals(listOf("o1"), room.objects.map { it.id })
+        assertEquals("mall", room.venueId)
+        assertEquals(1, loaded.first { it.destination.id == "b" }.walkedPoints.size)
+        assertEquals(0, loaded.flatMap { it.walkedPoints }.count { it.run == "stray" }) // unowned points are dropped
+        // The old file is kept as a backup, and loading again doesn't migrate twice.
+        assertFalse(File(parent, "ar_data.json").exists())
+        assertTrue(File(parent, "ar_data.json.migrated").exists())
+        assertEquals(loaded.map { it.destination.id }.toSet(), store.load("mall").map { it.destination.id }.toSet())
+    }
+
+    @Test
+    fun splitsTheThreeOldestFilesToo() = withStore { store, paths, parent ->
+        val serializerD = kotlinx.serialization.builtins.ListSerializer(CustomDestination.serializer())
+        val serializerP = kotlinx.serialization.builtins.ListSerializer(WalkedPoint.serializer())
+        val serializerO = kotlinx.serialization.builtins.ListSerializer(PlacedObject.serializer())
+        File(parent, "custom_destinations.json").writeText(json.encodeToString(serializerD, listOf(destination("d1", "Sofa", 1f, 2f))))
+        File(parent, "walked_path.json").writeText(json.encodeToString(serializerP,
+            listOf(point("mine", 0, 0f, 0f), point("mine", 1, 1f, 2f), point("stray", 0, 0f, 0f), point("stray", 1, 4f, 4f))))
+        File(parent, "placed_objects.json").writeText(json.encodeToString(serializerO, listOf(obj("o1").copy(destinationId = "d1"))))
+
+        val loaded = store.load("mall").single()
+        assertEquals(listOf("sofa.json"), paths.list()!!.toList())
+        assertEquals(setOf("mine"), loaded.walkedPoints.map { it.run }.toSet()) // the run that ends at Sofa
+        assertEquals(listOf("o1"), loaded.objects.map { it.id })
+        assertTrue(File(parent, "walked_path.json.migrated").exists())
+        assertFalse(File(parent, "walked_path.json").exists())
+    }
+
+    @Test
+    fun oldRecordsWithoutNewFieldsStillLoad() = withStore { store, paths, _ ->
+        paths.mkdirs()
+        File(paths, "old.json").writeText(
+            """{"destination":{"id":"d","name":"Old","level":"L0","x":1,"z":2,"createdAtMillis":1},
+               "walkedPoints":[{"run":"r","sequence":0,"level":"L0","x":0,"y":0,"z":0}],
+               "objects":[{"id":"o","kind":"cup","level":"L0","x":1,"y":0,"z":2}]}""",
+        )
+        val loaded = store.load("anything").single()
+        assertFalse(loaded.objects.single().isReference)
+        assertEquals("", loaded.walkedPoints.single().destinationId)
+        assertEquals(1, loaded.formatVersion)
     }
 }
