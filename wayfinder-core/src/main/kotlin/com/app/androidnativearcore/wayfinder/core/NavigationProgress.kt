@@ -57,18 +57,26 @@ class NavigationTracker(val route: Route) {
 
         val along = best?.second ?: 0f
         val distanceFromRoute = best?.first ?: Float.POSITIVE_INFINITY
-        val hasArrived = onDestinationLevel && destinationDistance <= arrivalRadius
+        // Close to the destination in a straight line is not enough: the user must also be at the END of the route. A
+        // path that starts (or passes) near its destination, or loops back to it, must not count as arrived on the way.
+        val remaining = max(0f, route.length - along)
+        val hasArrived = onDestinationLevel && destinationDistance <= arrivalRadius && remaining <= arrivalRadius + ARRIVAL_ROUTE_SLACK_M
         val next = route.maneuvers.firstOrNull { it.kind != Maneuver.Kind.Start && it.distanceFromStart > along + 0.5f }
             ?: route.maneuvers.lastOrNull()
 
         return NavigationProgress(
             distanceAlongRoute = along,
-            remainingDistance = max(0f, route.length - along),
+            remainingDistance = remaining,
             distanceFromRoute = distanceFromRoute,
             nextManeuver = next,
             distanceToNextManeuver = max(0f, (next?.distanceFromStart ?: route.length) - along),
             isOffRoute = !hasArrived && distanceFromRoute > offRouteThreshold,
             hasArrived = hasArrived,
         )
+    }
+
+    private companion object {
+        /** How much farther along the route than [arrivalRadius] the user may still be and count as having arrived. */
+        const val ARRIVAL_ROUTE_SLACK_M = 1.5f
     }
 }

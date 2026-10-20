@@ -94,6 +94,8 @@ class NavigationController(
     private val languages: List<String>? = null,
     /** Paths people walked; destinations the user added are routed along these instead of the venue network. */
     private val walkedPoints: List<WalkedPoint> = emptyList(),
+    /** The sign this destination's path was recorded from, if known; scanning another one is less accurate. */
+    private val recordedFromMarkerId: String = "",
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val venue: Venue get() = pkg.venue
@@ -126,31 +128,50 @@ class NavigationController(
     private var lastUpdate = Long.MIN_VALUE / 2
     private var lastPosition: Vec3? = null
     private var toastCounter = 0
+    private var arrivedSince: Long? = null
 
     private fun resolve(text: com.app.androidnativearcore.wayfinder.core.LocalizedText) =
         if (languages == null) text.resolved() else text.resolved(languages)
 
     init {
         showAlignmentPrompt(
-            "Look for a sign like these near entrances, elevators and escalators. " +
-                "Hold the phone so the whole sign is visible.",
+            if (recordedFromMarkerId.isNotEmpty()) recordedSignPrompt()
+            else "Look for a sign like these near entrances, elevators and escalators. Hold the phone so the whole sign is visible.",
         )
+    }
+
+    private fun recordedSignPrompt(): String {
+        val recorded = venue.marker(recordedFromMarkerId)?.let { resolve(it.name) } ?: recordedFromMarkerId
+        return "This path was recorded from “$recorded”. Scan that sign to start: face it, 1–${AlignmentFilter.CLOSE_DISTANCE_M} m away."
     }
 
     // region Session events
 
     /** A marker was detected: [markerInSession] is the pose of the image center in session coordinates. */
-    fun onMarkerDetected(marker: Venue.Marker, markerInSession: Mat4, distanceMeters: Float = 1f) {
+    fun onMarkerDetected(
+        marker: Venue.Marker,
+        markerInSession: Mat4,
+        distanceMeters: Float = 1f,
+        cameraInSession: Vec3? = null,
+        viewCosine: Float = 1f,
+    ) {
+        // A recorded path is only accurate relative to the sign it was recorded from. Another sign is placed in the
+        // venue by its surveyed position, which for a sign hung wherever it was convenient is wrong by far more than
+        // the path's own accuracy, and blending it in would pull everything out of place. So it is not used.
+        if (recordedFromMarkerId.isNotEmpty() && marker.id != recordedFromMarkerId) {
+            if (!alignmentFilter.isAligned) showAlignmentPrompt(recordedSignPrompt())
+            return
+        }
         val candidate = MarkerAlignment.alignment(markerInSession, MarkerAlignment.transform(marker))
         // Sightings are blended in by distance (close-ups count more) and only applied when they move the alignment
         // by a meaningful amount, so the scene doesn't jitter.
-        val changed = alignmentFilter.update(candidate, distanceMeters)
+        val changed = alignmentFilter.update(candidate, distanceMeters, viewCosine, cameraInSession)
         if (changed) alignment = alignmentFilter.alignment
         // The first sighting can come from several meters away, where a sign's pose is least precise. Wait for a few
         // close-up ones before drawing anything, so everything starts out accurately placed.
         if (!alignmentFilter.isLockedIn) {
             showAlignmentPrompt(
-                "Hold the phone steady, 1–${AlignmentFilter.CLOSE_DISTANCE_M} m from the sign " +
+                "Face the sign, 1–${AlignmentFilter.CLOSE_DISTANCE_M} m away, and move the phone slowly side to side " +
                     "(${alignmentFilter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)}/${AlignmentFilter.LOCK_IN_SIGHTINGS}).",
             )
             return
@@ -163,6 +184,7 @@ class NavigationController(
             needsRoute = true
             uiState = uiState.copy(isAligned = true, alignmentPrompt = null)
             showToast("Found “${resolve(marker.name)}”. Follow the arrows.")
+
         } else {
             uiState = uiState.copy(isAligned = true)
         }
@@ -207,8 +229,15 @@ class NavigationController(
 
         val progress = tracker.progress(position, level)
         if (progress.hasArrived) {
-            arrive()
-            return
+            // Arrived only after staying there for a moment, so a passing glance or a small jump of the alignment
+            // can't pop up "You have arrived" early.
+            val since = arrivedSince ?: now.also { arrivedSince = it }
+            if (now - since >= ARRIVAL_DWELL_MS) {
+                arrive()
+                return
+            }
+        } else {
+            arrivedSince = null
         }
         updateBanner(progress)
         showTips(position, level)
@@ -238,6 +267,7 @@ class NavigationController(
         val cam = cameraInSession.translation
         val user = uiState.user?.position
         val text = "tracking=${trackingMessage ?: "OK"}\naligned=$isAligned route=${route?.nodeIDs?.size ?: "none"} level=${uiState.renderedLevel}\n" +
+            "sign agreement ±%.1f cm, %.1f°\n".format(alignmentFilter.spreadCm, alignmentFilter.spreadDegrees) +
             "cam(session)=%.2f,%.2f,%.2f".format(cam.x, cam.y, cam.z) +
             (user?.let { "\nuser(venue)=%.2f,%.2f,%.2f".format(it.x, it.y, it.z) } ?: "")
         android.util.Log.i("WayFinder", text.replace("\n", " | "))
@@ -252,7 +282,11 @@ class NavigationController(
             } else {
                 planner.route(position, level, toPOI = destination.id, profile = profile)
             }
-            tracker = NavigationTracker(route)
+            tracker = NavigationTracker(route).also {
+                // A destination the user saved is where they stood, measured to centimeters; 2 m is several steps early.
+                it.arrivalRadius = if (destination.category == CustomDestination.CATEGORY) CUSTOM_ARRIVAL_RADIUS_M else 2f
+            }
+            arrivedSince = null
             uiState = uiState.copy(route = route, renderedLevel = level, banner = uiState.banner ?: placeholderBanner())
             listener?.onRoutePlanned(route, rerouted)
         } catch (e: Exception) {
@@ -342,4 +376,12 @@ class NavigationController(
     }
 
     // endregion
+
+    private companion object {
+        /** How close (meters) the user must get to a destination they saved for it to count as reached. */
+        const val CUSTOM_ARRIVAL_RADIUS_M = 1.0f
+
+        /** How long (ms) the user must stay within the arrival radius before "You have arrived" appears. */
+        const val ARRIVAL_DWELL_MS = 1_000L
+    }
 }

@@ -34,8 +34,16 @@ data class PlacedObject(
     /** The saved destination whose route this object belongs to ("" until the recording is saved). */
     val destinationId: String = "",
     val createdAtMillis: Long = 0L,
-    /** The path's reference point: the first object placed, marking where the path starts (drawn with a START beacon). */
+    /**
+     * Set on the automatic "reference point" object (a star at the start) that earlier versions added to every path.
+     * It is no longer created, and objects with this flag are not drawn; the field stays so old files still load.
+     */
     val isReference: Boolean = false,
+    /**
+     * Size multiplier. Objects placed far from the user are drawn larger (up to 2.5×), so they can still be seen
+     * from where they were placed and from along the route.
+     */
+    val scale: Float = 1f,
 ) {
     val position: Vec3 get() = Vec3(x, y, z)
 }
@@ -43,6 +51,9 @@ data class PlacedObject(
 /** The objects to show while navigating to [destinationId]. */
 fun List<PlacedObject>.forDestination(destinationId: String): List<PlacedObject> =
     filter { it.destinationId == destinationId }
+
+/** The size multiplier for an object [distanceMeters] away from the user: life-size up close, bigger when far. */
+fun objectScaleFor(distanceMeters: Float): Float = (distanceMeters / 1.5f).coerceIn(1f, 2.5f)
 
 /**
  * Where to put an object when the user taps "add" but the crosshair isn't on a surface: on the floor, [distance]

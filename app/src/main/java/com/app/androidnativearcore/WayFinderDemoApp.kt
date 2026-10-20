@@ -150,6 +150,9 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                         ),
                         walkedPoints = captured.path,
                         objects = captured.objects,
+                        startMarkerId = captured.startMarkerId,
+                        alignmentSpreadCm = captured.alignmentSpreadCm,
+                        driftCorrectedCm = captured.driftCorrectedCm,
                     ),
                 )
                 paths = store.load(basePackage.venue.id)
@@ -186,6 +189,7 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 // Routes follow the destination's own path, and only its objects are shown.
                 walkedPoints = paths.firstOrNull { it.destination.id == current.poi.id }?.walkedPoints.orEmpty(),
                 placedObjects = paths.firstOrNull { it.destination.id == current.poi.id }?.objects.orEmpty(),
+                recordedFromMarkerId = paths.firstOrNull { it.destination.id == current.poi.id }?.startMarkerId.orEmpty(),
                 debug = true,
             )
         }

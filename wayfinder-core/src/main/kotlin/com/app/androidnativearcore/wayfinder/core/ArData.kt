@@ -19,6 +19,15 @@ data class ArPath(
     val destination: CustomDestination,
     val walkedPoints: List<WalkedPoint> = emptyList(),
     val objects: List<PlacedObject> = emptyList(),
+    /** The sign the path was recorded from (scan the same one for the best accuracy); "" if unknown. */
+    val startMarkerId: String = "",
+    /**
+     * How well the sign sightings agreed when the path was recorded: their spread in centimeters. A big number
+     * (more than ~5) means a poor alignment, e.g. a sign of the wrong size, tilted, or moving. Null if unknown.
+     */
+    val alignmentSpreadCm: Float? = null,
+    /** How much drift (cm) re-scanning a sign during the walk corrected; null if no sign was re-scanned. */
+    val driftCorrectedCm: Float? = null,
 )
 
 /**

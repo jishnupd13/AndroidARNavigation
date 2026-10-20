@@ -21,7 +21,15 @@ import com.google.ar.core.TrackingState
 class SurfaceHit(val position: Vec3, val isPlane: Boolean, val createAnchor: () -> com.google.ar.core.Anchor)
 
 /** A marker ARCore is currently seeing, with the pose of its image center in session coordinates. */
-class MarkerSighting(val marker: Venue.Marker, val markerInSession: Mat4, val distanceMeters: Float)
+class MarkerSighting(
+    val marker: Venue.Marker,
+    val markerInSession: Mat4,
+    val distanceMeters: Float,
+    /** Where the camera was, in session coordinates. */
+    val cameraInSession: Vec3,
+    /** 1 when the camera looked at the sign head-on, near 0 when it saw it edge-on. */
+    val viewCosine: Float,
+)
 
 /**
  * ARCore side of marker alignment: registers the venue's AR signs as an [AugmentedImageDatabase] and turns
@@ -86,9 +94,43 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
             val distance = kotlin.math.sqrt(
                 (c.tx() - camera.tx()).let { it * it } + (c.ty() - camera.ty()).let { it * it } + (c.tz() - camera.tz()).let { it * it },
             )
-            out += MarkerSighting(marker, Mat4(matrix), distance)
+            // How head-on the view was: the angle between the sign's front normal and the direction to the camera.
+            val normal = c.yAxis
+            val toCamera = floatArrayOf(camera.tx() - c.tx(), camera.ty() - c.ty(), camera.tz() - c.tz())
+            val toCameraLength = kotlin.math.sqrt(toCamera[0] * toCamera[0] + toCamera[1] * toCamera[1] + toCamera[2] * toCamera[2])
+            val cosine = if (toCameraLength > 1e-4f) {
+                kotlin.math.abs((normal[0] * toCamera[0] + normal[1] * toCamera[1] + normal[2] * toCamera[2]) / toCameraLength)
+            } else 1f
+            out += MarkerSighting(marker, Mat4(matrix), distance, Vec3(camera.tx(), camera.ty(), camera.tz()), cosine)
         }
         return out
+    }
+
+    /**
+     * The ray (origin and unit direction, session coordinates) through screen position ([xPx], [yPx]) of a view of
+     * [widthPx] × [heightPx], for placing something where ARCore knows no surface.
+     */
+    fun rayThrough(frame: Frame, xPx: Float, yPx: Float, widthPx: Float, heightPx: Float): Pair<Vec3, Vec3> {
+        val projection = FloatArray(16)
+        val view = FloatArray(16)
+        frame.camera.getProjectionMatrix(projection, 0, 0.05f, 100f)
+        frame.camera.getViewMatrix(view, 0)
+        val viewProjection = FloatArray(16)
+        android.opengl.Matrix.multiplyMM(viewProjection, 0, projection, 0, view, 0)
+        val inverse = FloatArray(16)
+        android.opengl.Matrix.invertM(inverse, 0, viewProjection, 0)
+        val ndcX = 2f * xPx / widthPx - 1f
+        val ndcY = 1f - 2f * yPx / heightPx
+        fun unproject(ndcZ: Float): Vec3 {
+            val out = FloatArray(4)
+            android.opengl.Matrix.multiplyMV(out, 0, inverse, 0, floatArrayOf(ndcX, ndcY, ndcZ, 1f), 0)
+            return Vec3(out[0] / out[3], out[1] / out[3], out[2] / out[3])
+        }
+        val near = unproject(-1f)
+        val far = unproject(1f)
+        val d = far - near
+        val length = d.length.coerceAtLeast(1e-6f)
+        return near to Vec3(d.x / length, d.y / length, d.z / length)
     }
 
     /**

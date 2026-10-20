@@ -210,6 +210,27 @@ class NavigationTrackerTest {
     }
 
     @Test
+    fun aPathThatLoopsBackNearItsDestinationDoesNotArriveEarly() {
+        // Walk 8 m out and 8 m back along a U: the destination (end) is 1 m from the start.
+        val polyline = listOf(Vec3(0f, 0f, 0f), Vec3(0f, 0f, 8f), Vec3(1f, 0f, 8f), Vec3(1f, 0f, 0f))
+        val loop = RoutePlanner(makeVenue()).routeAlong(polyline, "L0", RouteProfile.FASTEST)
+        val tracker = NavigationTracker(loop)
+        // Standing at the start the destination is only 1 m away in a straight line, but 17 m of walking remain.
+        val atStart = tracker.progress(Vec3(0f, 0f, 0f), "L0")
+        assertFalse("must not arrive at the start", atStart.hasArrived)
+        assertTrue(atStart.remainingDistance > 15f)
+        // At the real end it does arrive.
+        assertTrue(tracker.progress(Vec3(1f, 0f, 0.3f), "L0").hasArrived)
+    }
+
+    @Test
+    fun theArrivalRadiusCanBeTightened() {
+        val tracker = NavigationTracker(route).apply { arrivalRadius = 1f }
+        assertFalse(tracker.progress(Vec3(10f, 0f, 8.5f), "L0").hasArrived) // 1.5 m before the end: not yet
+        assertTrue(tracker.progress(Vec3(10f, 0f, 9.4f), "L0").hasArrived)  // 0.6 m before it: arrived
+    }
+
+    @Test
     fun arrival() {
         val progress = NavigationTracker(route).progress(Vec3(10f, 0f, 9f), "L0")
         assertTrue(progress.hasArrived)
@@ -622,6 +643,15 @@ class PlacedObjectTest {
     }
 
     @Test
+    fun farObjectsAreDrawnLargerSoTheyCanBeSeen() {
+        assertNear(1f, objectScaleFor(0.5f))   // up close: life-size
+        assertNear(1f, objectScaleFor(1.5f))
+        assertNear(2f, objectScaleFor(3f))
+        assertNear(2.5f, objectScaleFor(20f))  // never more than 2.5x
+        assertNear(1f, obj("a", "d").scale)    // saved objects default to life-size
+    }
+
+    @Test
     fun fallbackPositionIsOnTheFloorAheadOfTheUser() {
         val p = fallbackObjectPosition(Vec3(2f, 1.4f, 3f), headingX = 0f, headingZ = 5f, floorY = 0f, distance = 1f)
         assertNear(2f, p.x); assertNear(0f, p.y); assertNear(4f, p.z)
@@ -816,5 +846,123 @@ class ArPathStoreTest {
         assertFalse(loaded.objects.single().isReference)
         assertEquals("", loaded.walkedPoints.single().destinationId)
         assertEquals(1, loaded.formatVersion)
+    }
+}
+
+class AlignmentTrackTest {
+    private val start = Mat4.yaw(0f, Vec3(10f, 0f, 20f))
+
+    @Test
+    fun aSingleScanKeepsTheSameAlignmentAllTheWay() {
+        val track = AlignmentTrack().apply { add(0f, start) }
+        listOf(0f, 3f, 50f).forEach { assertNear(10f, track.alignmentAt(it).translation.x) }
+    }
+
+    @Test
+    fun driftBetweenTwoScansIsSpreadAlongTheWalk() {
+        // The venue seems to have moved 10 cm (and turned 2 degrees) by the end of a 10 m walk: that is drift.
+        val end = Mat4.yaw(2f, Vec3(10.1f, 0f, 20f))
+        val track = AlignmentTrack().apply { add(0f, start); add(10f, end) }
+        assertNear(10f, track.alignmentAt(0f).translation.x)
+        assertNear(10.05f, track.alignmentAt(5f).translation.x, 1e-4f) // halfway
+        assertNear(10.1f, track.alignmentAt(10f).translation.x, 1e-4f)
+        assertNear(1f, Math.toDegrees(AlignmentFilter.yaw(track.alignmentAt(5f)).toDouble()).toFloat(), 0.01f)
+        // Before the first scan and after the last one, the nearest scan is used.
+        assertNear(10f, track.alignmentAt(-3f).translation.x)
+        assertNear(10.1f, track.alignmentAt(99f).translation.x)
+    }
+
+    @Test
+    fun correctingDriftBringsTheEndOfAPathBackOntoTheTruth() {
+        // Real venue positions along a 10 m straight walk (z from 0 to 10). ARCore drifts: its session frame slides
+        // 12 cm sideways by the end. With one alignment (from the start scan) the end is 12 cm off; with the track
+        // (start and end scans) it is not.
+        val truth = (0..10).map { Vec3(1f, 1.4f, it.toFloat()) }
+        fun sessionOf(venuePoint: Vec3, progress: Float) = start.transformPoint(Vec3(venuePoint.x + 0.012f * progress, venuePoint.y, venuePoint.z))
+        val raw = truth.mapIndexed { i, p -> RawWalkPoint("r", i, sessionOf(p, i.toFloat()), progress = i.toFloat()) }
+        // The end scan sees the venue 12 cm away from where the start scan put it.
+        val endAlignment = Mat4.yaw(0f, Vec3(10f + 0.12f, 0f, 20f))
+        val venue = makeVenue()
+
+        val withOneScan = raw.toWalkedPoints(venue, start.inverse(), "L0")
+        val withTrack = raw.toWalkedPoints(venue, AlignmentTrack().apply { add(0f, start); add(10f, endAlignment) }, "L0")
+        val errorOneScan = kotlin.math.abs(withOneScan.last().x - 1f)
+        val errorWithTrack = kotlin.math.abs(withTrack.last().x - 1f)
+        assertTrue("one scan leaves $errorOneScan m at the end", errorOneScan > 0.1f)
+        assertTrue("the track corrects it to $errorWithTrack m", errorWithTrack < 0.01f)
+        assertNear(0.12f, AlignmentTrack().apply { add(0f, start); add(10f, endAlignment) }.totalDriftMeters(raw.last().position), 0.01f)
+    }
+
+    @Test
+    fun recorderCountsHowFarTheUserWalked() {
+        val recorder = SessionPathRecorder(runId = "r", smoothing = 1f)
+        for (i in 0..16) recorder.record(Vec3(0f, 1.4f, i * 0.25f)) // 4 m in 25 cm steps
+        assertNear(4f, recorder.progress, 0.01f)
+        assertNear(4f, recorder.points.last().progress, 0.01f)
+        assertEquals(0f, recorder.points.first().progress)
+        recorder.clear()
+        assertEquals(0f, recorder.progress)
+    }
+}
+
+class AlignmentSpreadTest {
+    @Test
+    fun agreeingSightingsHaveNoSpreadAndNoisyOnesDo() {
+        val steady = AlignmentFilter()
+        repeat(6) { steady.update(Mat4.yaw(10f, Vec3(2f, 0f, 3f)), 1f) }
+        assertNear(0f, steady.spreadCm, 0.01f)
+        assertNear(0f, steady.spreadDegrees, 0.01f)
+
+        val noisy = AlignmentFilter()
+        for (i in 0 until 6) noisy.update(Mat4.yaw(10f + if (i % 2 == 0) 3f else -3f, Vec3(2f + if (i % 2 == 0) 0.1f else -0.1f, 0f, 3f)), 1f)
+        assertTrue("about 10 cm of scatter, was ${noisy.spreadCm}", noisy.spreadCm in 8f..12f)
+        assertTrue("about 3 degrees, was ${noisy.spreadDegrees}", noisy.spreadDegrees in 2.5f..3.5f)
+        noisy.reset()
+        assertEquals(0f, noisy.spreadCm)
+    }
+}
+
+class SightingQualityTest {
+    private val truth = Mat4.yaw(10f, Vec3(2f, 0f, 3f))
+
+    @Test
+    fun obliqueSightingsCountForMuchLess() {
+        // Nine head-on sightings read the truth; one edge-on sighting reads 40 cm off. It barely moves the alignment...
+        val withOblique = AlignmentFilter().apply {
+            repeat(5) { update(truth, 1f, viewCosine = 1f) }
+            update(Mat4.yaw(10f, Vec3(2.4f, 0f, 3f)), 1f, viewCosine = 0.25f)
+        }
+        // ...whereas counted like a head-on one, the same reading would have dragged it much further.
+        val asIfHeadOn = AlignmentFilter().apply {
+            repeat(5) { update(truth, 1f, viewCosine = 1f) }
+            update(Mat4.yaw(10f, Vec3(2.4f, 0f, 3f)), 1f, viewCosine = 1f)
+        }
+        val errorOblique = kotlin.math.abs(withOblique.alignment.translation.x - 2f)
+        val errorHeadOn = kotlin.math.abs(asIfHeadOn.alignment.translation.x - 2f)
+        assertTrue("oblique $errorOblique vs head-on $errorHeadOn", errorOblique < errorHeadOn * 0.4f)
+    }
+
+    @Test
+    fun obliqueSightingsDoNotCountTowardLockIn() {
+        val filter = AlignmentFilter()
+        repeat(10) { filter.update(truth, 1f, viewCosine = 0.3f) }
+        assertEquals(0, filter.closeSightings)
+        assertFalse(filter.isLockedIn)
+    }
+
+    @Test
+    fun lockInNeedsDifferentViewpointsOrPatience() {
+        val standingStill = AlignmentFilter()
+        val spot = Vec3(2f, 1.4f, 5f)
+        repeat(3) { standingStill.update(truth, 1.5f, 1f, spot) }
+        assertEquals(0f, standingStill.viewSpreadMeters, 1e-6f)
+        assertFalse("three sightings from one spot are not enough", standingStill.isLockedIn)
+        repeat(5) { standingStill.update(truth, 1.5f, 1f, spot) }
+        assertTrue("after 8 it gives in", standingStill.isLockedIn)
+
+        val moving = AlignmentFilter()
+        listOf(0f, 0.08f, 0.2f).forEach { dx -> moving.update(truth, 1.5f, 1f, Vec3(2f + dx, 1.4f, 5f)) }
+        assertTrue(moving.viewSpreadMeters >= 0.12f)
+        assertTrue("moving 20 cm is enough", moving.isLockedIn)
     }
 }

@@ -37,6 +37,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.app.androidnativearcore.wayfinder.core.AlignmentFilter
+import com.app.androidnativearcore.wayfinder.core.AlignmentTrack
 import com.app.androidnativearcore.wayfinder.core.MarkerAlignment
 import com.app.androidnativearcore.wayfinder.core.Mat4
 import com.app.androidnativearcore.wayfinder.core.PlacedObject
@@ -46,6 +47,7 @@ import com.app.androidnativearcore.wayfinder.core.Vec3
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
 import com.app.androidnativearcore.wayfinder.core.WalkedPoint
+import com.app.androidnativearcore.wayfinder.core.objectScaleFor
 import com.app.androidnativearcore.wayfinder.core.spreadObjectPosition
 import com.app.androidnativearcore.wayfinder.core.straightWalk
 import com.app.androidnativearcore.wayfinder.core.toVenue
@@ -72,6 +74,12 @@ data class CapturedDestination(
     val objects: List<PlacedObject> = emptyList(),
     /** Height of the real floor under the destination, in venue coordinates (null if unknown). */
     val floorY: Float? = null,
+    /** The sign the walk started from. */
+    val startMarkerId: String = "",
+    /** How well the sign sightings agreed while recording, in centimeters (smaller is better). */
+    val alignmentSpreadCm: Float? = null,
+    /** How much drift (cm) re-scanning a sign during the walk corrected; null if no sign was re-scanned. */
+    val driftCorrectedCm: Float? = null,
 )
 
 /** Shortest recorded walk (meters) that is worth saving as a route. */
@@ -97,8 +105,13 @@ private fun averageOf(points: Collection<Vec3>): Vec3? {
     )
 }
 
-/** The reference point is shown as this object, where the user stood when the path started. */
-private val REFERENCE_KIND = PlacedObjectKind.STAR
+/** Sightings of a sign closer together in time than this belong to one scan ("visit"); a longer gap starts a new one. */
+private const val VISIT_GAP_MS = 4_000L
+
+/** One scan of a sign: the alignment its sightings gave, and how far the user had walked when it happened. */
+private class Visit(var progress: Float, var lastMs: Long) {
+    val filter = AlignmentFilter()
+}
 
 /** Typical height of a phone above the floor, to put the reference object on the floor under the scan position. */
 private const val PHONE_HEIGHT_M = 1.4f
@@ -124,8 +137,9 @@ private class LiveUser {
  *
  * 1. The user scans an AR sign. After a moment of close-up sightings the alignment is locked in and **recording
  *    starts**.
- * 2. The **reference point** appears by itself: an object at the spot the user scanned from. They walk to the
- *    destination, picking objects from the bar at the bottom and **tapping the screen** where each one goes.
+ * 2. They walk to the destination, picking objects from the bar at the bottom and **tapping the screen** where each
+ *    one goes. Scanning a sign again on the way (for example at the end) corrects the drift ARCore built up: the
+ *    path is converted with an alignment that follows the scans along the walk.
  * 3. The walk and the objects are recorded in the AR session's own (stable) frame, like iOS anchors, and converted
  *    to venue coordinates once, with the best alignment, when **Save destination here** is tapped. The destination
  *    is set automatically: it is where the user stands when saving. Routes to it follow the walked path (around
@@ -162,7 +176,11 @@ fun WayFinderCaptureScreen(
     val user = remember { LiveUser() }
     val pendingTap = remember { FloatArray(3) }   // x, y, and 1 when a tap waits to be handled in the next frame
     var lostSince by remember { mutableStateOf<Long?>(null) }
-    val referenceAdded = remember(pkg) { BooleanArray(1) } // the automatic reference object exists
+    // Every scan of a sign, with how far the walk had got. Their alignments are interpolated along the walk to remove drift.
+    val visits = remember(pkg) { mutableListOf<Visit>() }
+    val otherSignToastMs = remember { LongArray(1) } // when the "scan the same sign" hint was last shown
+    val objectProgress = remember(pkg) { HashMap<String, Float>() } // how far the walk had got when each object was placed
+    val driftCm = remember { FloatArray(1) }                         // the most drift a re-scan has corrected so far
     val recent = remember(pkg) { ArrayDeque<Vec3>() }       // the phone's latest positions, to tell when it is held steady
     val floorSamples = remember(pkg) { ArrayDeque<Float>() } // recent floor heights (session frame) from detected planes
     val frameCounter = remember { IntArray(1) }
@@ -170,6 +188,7 @@ fun WayFinderCaptureScreen(
     // --- What the user sees (only things that change rarely) ---
     var lockedIn by remember { mutableStateOf(false) }
     var lockProgress by remember { mutableStateOf(0) }
+    var signAgreement by remember { mutableStateOf("") } // how well the sign sightings agree, e.g. "sign ±2 cm"
     var levelName by remember { mutableStateOf("") }
     var recordedSummary by remember { mutableStateOf("") }
     var canSave by remember { mutableStateOf(false) }
@@ -227,16 +246,23 @@ fun WayFinderCaptureScreen(
         }
     }
 
+    /** The alignment along the walk: one entry per scan of a sign that had a few close-up sightings. */
+    fun buildTrack(): AlignmentTrack = AlignmentTrack().also { track ->
+        visits.filter { it.filter.closeSightings >= 2 }.forEach { track.add(it.progress, it.filter.alignment) }
+        if (track.isEmpty) track.add(0f, filter.alignment)
+    }
+
     /**
-     * Converts what was recorded in the session frame to venue coordinates with the current alignment and keeps it.
+     * Converts what was recorded in the session frame to venue coordinates and keeps it. Each point and object is
+     * converted with the alignment for the moment of the walk it belongs to, so drift between scans is corrected.
      * Done when saving, and when tracking is lost (after which the session frame can't be trusted any more).
      */
     fun commit() {
         val marker = startMarker ?: return
-        val venueFromSession = filter.alignment.inverse()
+        val track = buildTrack()
         val raw = recorder.points
         if (raw.isNotEmpty()) {
-            val converted = raw.toWalkedPoints(venue, venueFromSession, marker.level, floorSessionY())
+            val converted = raw.toWalkedPoints(venue, track, marker.level, floorSessionY())
             if (committedPath.isEmpty()) {
                 // Start the path at the sign itself, then straight to where the user first stood: they just looked at
                 // the sign, so the way between is clear. This lets routes begin at the sign later.
@@ -250,38 +276,57 @@ fun WayFinderCaptureScreen(
             recorder.clear()
         }
         refreshFromAnchors()
-        val yaw = yawDegrees(filter.alignment)
-        committedObjects += sessionObjects.map { it.toVenue(venue, venueFromSession, yaw, marker.level) }
+        committedObjects += sessionObjects.map { obj ->
+            val alignmentHere = track.alignmentAt(objectProgress[obj.id] ?: 0f)
+            obj.toVenue(venue, alignmentHere.inverse(), yawDegrees(alignmentHere), marker.level)
+        }
         sessionObjects.clear()
+        objectProgress.clear()
         anchors.values.forEach { it.detach() }
         anchors.clear()
     }
 
-    /** What a tap does: puts the selected object (or the destination pin) on the surface under the finger. */
+    /**
+     * What a tap does: puts the selected object where the user tapped. On a surface ARCore knows, it goes exactly
+     * there. Where ARCore knows no surface yet (blank wall, glass, a spot it hasn't scanned), it still goes somewhere
+     * sensible, on the floor along the tapped direction, and the user is told, so a tap is never ignored.
+     */
     fun handleTap(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session, x: Float, y: Float) {
         if (selectedKind == PlacedObjectKind.MESSAGE && messageText.isBlank()) {
             showToast("Type your message first, then tap where it goes.")
             return
         }
-        val hit = markerTracker.surfaceAt(frame, session, x, y, MAX_OBJECT_DISTANCE_M)
-        if (hit == null) {
-            showToast("No surface found there. Move the phone slowly so ARCore can scan it, then tap again.", 2_500)
-            return
-        }
         val cameraPosition = Vec3(camera[0], camera[1], camera[2])
-        val spot = spreadObjectPosition(hit.position, sessionObjects.map { it.position }, MIN_OBJECT_SEPARATION_M)
+        val hit = markerTracker.surfaceAt(frame, session, x, y, MAX_OBJECT_DISTANCE_M)
+        val onSurface = hit != null
+        val wanted = hit?.position ?: run {
+            val (origin, direction) = markerTracker.rayThrough(frame, x, y, view.width.toFloat(), view.height.toFloat())
+            val floor = floorSessionY()
+            val toFloor = if (direction.y < -0.05f) (floor - origin.y) / direction.y else -1f
+            // The floor if the tap points at it within reach; otherwise a spot 1.5 m along the tapped direction.
+            val along = if (toFloor in 0.5f..MAX_OBJECT_DISTANCE_M) toFloor else 1.5f
+            Vec3(origin.x + direction.x * along, if (toFloor in 0.5f..MAX_OBJECT_DISTANCE_M) floor else origin.y + direction.y * along, origin.z + direction.z * along)
+        }
+        val spot = spreadObjectPosition(wanted, sessionObjects.map { it.position }, MIN_OBJECT_SEPARATION_M)
         val id = "object-" + java.util.UUID.randomUUID()
-        // Anchor to the tapped surface itself; only an object nudged off its spot gets a free-standing anchor.
-        anchors[id] = if (spot == hit.position) hit.createAnchor()
+        // Anchor to the tapped surface itself; an object nudged off its spot, or placed without a surface, gets a
+        // free-standing anchor at its position.
+        anchors[id] = if (hit != null && spot == hit.position) hit.createAnchor()
         else session.createAnchor(Pose(floatArrayOf(spot.x, spot.y, spot.z), floatArrayOf(0f, 0f, 0f, 1f)))
         // Turn the object's front toward the user who is placing it.
         val yaw = Math.toDegrees(kotlin.math.atan2((cameraPosition.x - spot.x).toDouble(), (cameraPosition.z - spot.z).toDouble())).toFloat()
+        val distance = spot.distanceTo(cameraPosition)
+        objectProgress[id] = recorder.progress
         sessionObjects += PlacedObject(
             id = id, kind = selectedKind, level = "", x = spot.x, y = spot.y, z = spot.z, yawDegrees = yaw,
             text = if (selectedKind == PlacedObjectKind.MESSAGE) messageText.trim() else "",
-            createdAtMillis = System.currentTimeMillis(),
+            createdAtMillis = System.currentTimeMillis(), scale = objectScaleFor(distance),
         )
-        showToast("${selectedKind.label} added", 1_500)
+        showToast(
+            if (onSurface) "${selectedKind.label} added, %.1f m away".format(distance)
+            else "${selectedKind.label} added %.1f m away (no surface found there, so it is on the floor)".format(distance),
+            if (onSurface) 1_800 else 3_000,
+        )
     }
 
     Box(modifier.fillMaxSize().background(Color.Black)) {
@@ -306,6 +351,7 @@ fun WayFinderCaptureScreen(
                     if (now - since > TRACKING_LOST_RESET_MS && filter.isAligned) {
                         commit()
                         filter.reset()
+                        visits.clear()
                         lockedIn = false
                         lockProgress = 0
                         user.valid = false
@@ -318,11 +364,39 @@ fun WayFinderCaptureScreen(
 
                 val interval = if (lockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else LOCK_IN_INTERVAL_MS
                 for (sighting in markerTracker.sightings(frame, now, interval)) {
-                    // The first sign aligns; later sightings are blended in by distance (close-ups count more).
+                    // The walk is measured from one sign. Another sign sits in the venue at its surveyed position, which for
+                    // a sign hung wherever it was convenient is wrong, and blending it in would bend the whole path. So after
+                    // the first sign, only that same sign is used (to lock in and to correct drift when re-scanned).
+                    val start = startMarker
+                    if (start != null && sighting.marker.id != start.id) {
+                        if (now - otherSignToastMs[0] > 6_000) {
+                            otherSignToastMs[0] = now
+                            showToast("This path is measured from “${start.name.resolved()}”. Scan that sign again, not another one.", 3_500)
+                        }
+                        continue
+                    }
+                    // The first sign aligns; later sightings are blended in by distance, head-on view and viewpoint variety.
                     val candidate = MarkerAlignment.alignment(sighting.markerInSession, MarkerAlignment.transform(sighting.marker))
-                    if (filter.update(candidate, sighting.distanceMeters)) alignment = filter.alignment
+                    if (filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, sighting.cameraInSession)) alignment = filter.alignment
                     if (startMarker == null) startMarker = sighting.marker
+
+                    // Keep every scan of a sign separately, with how far the walk had got: re-scanning a sign later shows
+                    // how much ARCore drifted since the first scan, and that drift is then removed from the path.
+                    val visit = visits.lastOrNull()?.takeIf { now - it.lastMs < VISIT_GAP_MS }
+                        ?: Visit(recorder.progress, now).also { visits += it }
+                    val closeBefore = visit.filter.closeSightings
+                    visit.filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, sighting.cameraInSession)
+                    visit.progress = recorder.progress
+                    visit.lastMs = now
+                    if (visits.size >= 2 && closeBefore < 2 && visit.filter.closeSightings >= 2) {
+                        val drift = AlignmentTrack.driftMeters(Vec3(camera[0], camera[1], camera[2]), visits.first().filter.alignment, visit.filter.alignment)
+                        driftCm[0] = maxOf(driftCm[0], drift * 100f)
+                        showToast("Sign re-scanned: ${"%.0f".format(drift * 100f)} cm of drift corrected", 3_500)
+                    }
                 }
+                val spread = filter.spreadCm.toInt()
+                val agreement = if (filter.isLockedIn) "sign ±$spread cm" else ""
+                if (agreement != signAgreement) signAgreement = agreement
                 lockProgress = filter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)
                 lockedIn = filter.isLockedIn
 
@@ -352,17 +426,6 @@ fun WayFinderCaptureScreen(
                     val isSteady = mean != null && recent.size >= STEADY_FRAMES &&
                         recent.all { hypot(it.x - mean.x, it.z - mean.z) <= STEADY_RADIUS_M }
                     if (isSteady != steady) steady = isSteady
-                    if (!referenceAdded[0]) {
-                        // The reference point: an object on the floor where the user scanned from.
-                        referenceAdded[0] = true
-                        val spot = Vec3(cameraSession.x, floorSessionY(), cameraSession.z)
-                        val id = "reference-" + java.util.UUID.randomUUID()
-                        anchors[id] = session.createAnchor(Pose(floatArrayOf(spot.x, spot.y, spot.z), floatArrayOf(0f, 0f, 0f, 1f)))
-                        sessionObjects += PlacedObject(
-                            id = id, kind = REFERENCE_KIND, level = "", x = spot.x, y = spot.y, z = spot.z,
-                            createdAtMillis = System.currentTimeMillis(), isReference = true,
-                        )
-                    }
                     refreshFromAnchors()
                     val length = committedLength() + recorder.lengthMeters
                     canSave = length >= MIN_PATH_LENGTH_M
@@ -373,6 +436,7 @@ fun WayFinderCaptureScreen(
                         handleTap(frame, session, pendingTap[0], pendingTap[1])
                     }
                 } else {
+                    if (pendingTap[2] == 1f) showToast("Tracking is limited right now. Hold still for a moment, then tap again.", 2_500)
                     pendingTap[2] = 0f
                     recent.clear()
                     if (steady) steady = false
@@ -401,7 +465,7 @@ fun WayFinderCaptureScreen(
             when {
                 startMarker == null -> AlignmentPromptView(
                     trackingMessage ?: "Look for a sign like these near entrances, elevators and escalators. " +
-                        "Scanning it starts recording your walk.",
+                        "Face it from 1–2.5 m and move the phone slowly side to side; scanning it starts recording your walk.",
                     signs,
                 )
                 !lockedIn -> GuidanceBannerView(
@@ -409,7 +473,7 @@ fun WayFinderCaptureScreen(
                         instruction = "Locking onto the sign…",
                         glyph = "◎",
                         detail = trackingMessage
-                            ?: "Hold the phone steady, 1–3 m from the sign ($lockProgress/${AlignmentFilter.LOCK_IN_SIGHTINGS})",
+                            ?: "Face the sign, 1–2.5 m away, and move the phone slowly side to side ($lockProgress/${AlignmentFilter.LOCK_IN_SIGHTINGS})",
                     ),
                 )
                 else -> {
@@ -419,7 +483,7 @@ fun WayFinderCaptureScreen(
                             instruction = if (canSave) "Walk to the destination, then save it" else "Walk to where the destination is",
                             glyph = "●",
                             detail = trackingMessage ?: listOfNotNull(
-                                levelName.ifEmpty { null }, recordedSummary.ifEmpty { null },
+                                levelName.ifEmpty { null }, recordedSummary.ifEmpty { null }, signAgreement.ifEmpty { null },
                                 if (objectCount > 0) "$objectCount object${if (objectCount == 1) "" else "s"}" else null,
                             ).joinToString(" · "),
                         ),
@@ -468,6 +532,9 @@ fun WayFinderCaptureScreen(
                             pendingDestination = averageOf(recent) ?: user.session
                             pendingLevel = user.level
                             pendingFloorSession = floorSessionY()
+                            if (recorder.progress >= 8f && visits.count { it.filter.closeSightings >= 2 } < 2) {
+                                showToast("Tip: scan a sign again at the end next time, to correct drift.", 3_500)
+                            }
                             naming = true
                         },
                     ) {
@@ -499,15 +566,19 @@ fun WayFinderCaptureScreen(
                         val spot = pendingDestination!!
                         recorder.recordAnchor(spot)
                         refreshFromAnchors()
-                        val venueFromSession = filter.alignment.inverse()
+                        val track = buildTrack()
+                        // The destination and its floor use the alignment for the end of the walk (the last scan).
+                        val venueFromSession = track.venueFromSessionAt(recorder.progress)
                         val here = venueFromSession.transformPoint(spot)
-                        // The real floor under the destination, in venue coordinates, so the pin stands on it.
                         val floorY = venueFromSession.transformPoint(Vec3(spot.x, pendingFloorSession, spot.z)).y
+                        val spreadCm = visits.firstOrNull()?.filter?.spreadCm
+                        val drift = driftCm[0].takeIf { it > 0f }
+                        val startId = startMarker?.id.orEmpty()
                         commit()
                         onSave(
                             CapturedDestination(
                                 name.trim(), pendingLevel, here.x, here.z, committedPath.toList(), committedObjects.toList(),
-                                floorY = floorY,
+                                floorY = floorY, startMarkerId = startId, alignmentSpreadCm = spreadCm, driftCorrectedCm = drift,
                             ),
                         )
                     },

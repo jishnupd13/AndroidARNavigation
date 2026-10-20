@@ -52,6 +52,8 @@ fun WayFinderNavigationScreen(
     walkedPoints: List<com.app.androidnativearcore.wayfinder.core.WalkedPoint> = emptyList(),
     /** Objects placed while recording; those belonging to this destination are shown along the way. */
     placedObjects: List<com.app.androidnativearcore.wayfinder.core.PlacedObject> = emptyList(),
+    /** The sign this destination's path was recorded from, if known. */
+    recordedFromMarkerId: String = "",
     modifier: Modifier = Modifier,
     debug: Boolean = false,
 ) {
@@ -64,7 +66,7 @@ fun WayFinderNavigationScreen(
     }
 
     val controller = remember(pkg, destinationId, profile, walkedPoints) {
-        NavigationController(pkg, destination, profile, listener, languages, walkedPoints)
+        NavigationController(pkg, destination, profile, listener, languages, walkedPoints, recordedFromMarkerId)
     }
     controller.listener = listener
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
@@ -99,7 +101,7 @@ fun WayFinderNavigationScreen(
             onSessionUpdated = { _, frame ->
                 val now = frame.timestamp / 1_000_000
                 for (sighting in markerTracker.sightings(frame, now, if (controller.isLockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else 500L)) {
-                    controller.onMarkerDetected(sighting.marker, sighting.markerInSession, sighting.distanceMeters)
+                    controller.onMarkerDetected(sighting.marker, sighting.markerInSession, sighting.distanceMeters, sighting.cameraInSession, sighting.viewCosine)
                 }
                 val matrix = FloatArray(16)
                 frame.camera.pose.toMatrix(matrix, 0)

@@ -198,7 +198,13 @@ class WalkedPathRouter(
 }
 
 /** A recorded position in the AR session's own frame, before it is converted to venue coordinates. */
-data class RawWalkPoint(val run: String, val sequence: Int, val position: Vec3)
+data class RawWalkPoint(
+    val run: String,
+    val sequence: Int,
+    val position: Vec3,
+    /** How far the user had walked (meters) when this point was recorded: the "time" of the walk, for drift correction. */
+    val progress: Float = 0f,
+)
 
 /**
  * Records the user's walk in the AR session's own frame, one point every [spacing] meters, like the iOS
@@ -222,9 +228,13 @@ class SessionPathRecorder(
     private var nextSequence = 0
     private var last: Vec3? = null
     private var smoothed: Vec3? = null
+    private var totalProgress = 0f
     private val recorded = mutableListOf<RawWalkPoint>()
 
     val points: List<RawWalkPoint> get() = recorded
+
+    /** How far the user has walked since the recording began (meters, tracking jumps excluded). */
+    val progress: Float get() = totalProgress
 
     /** Length of everything recorded so far, in meters. */
     val lengthMeters: Float
@@ -246,21 +256,24 @@ class SessionPathRecorder(
         if (previous != null) {
             val moved = horizontalDistance(previous, position)
             if (moved < spacing) return
-            // A big jump means tracking was corrected; don't link across the gap.
+            // A big jump means tracking was corrected; don't link across the gap (or count it as walked).
             if (moved > 3f) {
                 startNewRun()
                 smoothed = cameraInSession
+            } else {
+                totalProgress += moved
             }
         }
         val point = smoothed ?: position
-        recorded += RawWalkPoint(run, nextSequence, point)
+        recorded += RawWalkPoint(run, nextSequence, point, totalProgress)
         nextSequence += 1
         last = point
     }
 
     /** Adds a point at [position] regardless of spacing (e.g. exactly where the user stands when saving). */
     fun recordAnchor(position: Vec3) {
-        recorded += RawWalkPoint(run, nextSequence, position)
+        last?.let { totalProgress += horizontalDistance(it, position).takeIf { moved -> moved <= 3f } ?: 0f }
+        recorded += RawWalkPoint(run, nextSequence, position, totalProgress)
         nextSequence += 1
         last = position
         smoothed = position
@@ -271,6 +284,7 @@ class SessionPathRecorder(
         last = null
         smoothed = null
         nextSequence = 0
+        totalProgress = 0f
         run = newRunId()
     }
 
@@ -296,6 +310,25 @@ fun List<RawWalkPoint>.toWalkedPoints(
     floorSessionY: Float? = null,
 ): List<WalkedPoint> =
     map { raw ->
+        val v = venueFromSession.transformPoint(raw.position)
+        val level = venue.level(forDeviceHeight = v.y)?.id ?: fallbackLevel
+        val floorY = floorSessionY?.let { venueFromSession.transformPoint(Vec3(raw.position.x, it, raw.position.z)).y }
+            ?: venue.level(level)?.elevation ?: 0f
+        WalkedPoint(raw.run, raw.sequence, level, v.x, floorY, v.z)
+    }
+
+/**
+ * Like [toWalkedPoints] with one alignment, but each point is converted with the alignment [track] gives for the
+ * moment of the walk it was recorded at, so drift that built up while walking is corrected (see [AlignmentTrack]).
+ */
+fun List<RawWalkPoint>.toWalkedPoints(
+    venue: Venue,
+    track: AlignmentTrack,
+    fallbackLevel: String,
+    floorSessionY: Float? = null,
+): List<WalkedPoint> =
+    map { raw ->
+        val venueFromSession = track.venueFromSessionAt(raw.progress)
         val v = venueFromSession.transformPoint(raw.position)
         val level = venue.level(forDeviceHeight = v.y)?.id ?: fallbackLevel
         val floorY = floorSessionY?.let { venueFromSession.transformPoint(Vec3(raw.position.x, it, raw.position.z)).y }

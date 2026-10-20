@@ -35,10 +35,13 @@ fun ARSceneScope.ObjectsScene(
     alignment: Mat4,
     cameraPosition: () -> Position,
 ) {
-    if (objects.isEmpty()) return
+    // Only the objects the user placed. Paths saved by an earlier version may hold an automatic "reference point"
+    // object (a star at the start); it is no longer wanted, so it is never drawn.
+    val shown = objects.filter { !it.isReference }
+    if (shown.isEmpty()) return
     val (position, rotation) = rootPose(alignment)
     Node(position = position, rotation = rotation) {
-        for (obj in objects) key(obj.id) { PlacedObjectNode(obj, cameraPosition) }
+        for (obj in shown) key(obj.id) { PlacedObjectNode(obj, cameraPosition) }
     }
 }
 
@@ -67,7 +70,10 @@ private object ObjectColors {
 
 @Composable
 private fun SceneScope.PlacedObjectNode(obj: PlacedObject, cameraPosition: () -> Position) {
-    Node(position = Position(obj.x, obj.y, obj.z), rotation = Rotation(y = obj.yawDegrees)) {
+    Node(
+        position = Position(obj.x, obj.y, obj.z), rotation = Rotation(y = obj.yawDegrees),
+        scale = Scale(obj.scale, obj.scale, obj.scale),
+    ) {
         when (obj.kind) {
             PlacedObjectKind.CUP -> Mug()
             PlacedObjectKind.GIFT -> Gift()
