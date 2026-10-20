@@ -274,6 +274,22 @@ class MarkerAlignmentTest {
     }
 
     @Test
+    fun aSignLeaningBackDoesNotShiftTheVenue() {
+        // A wall sign 1.4 m up, but the real sign leans back 15° (a laptop screen). The venue must still land where the
+        // sign's center says it is: tilting the sign about its own center cannot move the center.
+        val markerInVenue = MarkerAlignment.transform(makeVenue().markers[0])
+        val venueInSession = Mat4.yaw(25f, Vec3(2f, 0f, -3f))
+        val leaning = MarkerAlignment.alignment(venueInSession * markerInVenue * Mat4.pitch(15f), markerInVenue)
+        val upright = MarkerAlignment.alignment(venueInSession * markerInVenue, markerInVenue)
+        assertTrue("tilt moved the venue by ${leaning.translation.distanceTo(upright.translation)} m",
+            leaning.translation.distanceTo(upright.translation) < 0.005f)
+        assertTrue(leaning.translation.distanceTo(venueInSession.translation) < 0.02f)
+        // And the yaw is unaffected by the lean.
+        assertTrue(MarkerAlignment.difference(leaning, venueInSession).degrees < 0.5f)
+        assertNear(1f, leaning[1, 1], 1e-6f) // still level
+    }
+
+    @Test
     fun difference() {
         val d = MarkerAlignment.difference(Mat4.yaw(0f), Mat4.yaw(10f, Vec3(0f, 0f, 2f)))
         assertNear(10f, d.degrees, 0.01f)

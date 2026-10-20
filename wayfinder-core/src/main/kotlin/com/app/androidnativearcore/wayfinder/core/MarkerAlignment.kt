@@ -39,10 +39,21 @@ object MarkerAlignment {
      *
      * ARKit applies it with `setWorldOrigin`; ARCore has no such call, so the app keeps this transform and
      * applies it to the content root (venue → session) and, inverted, to the camera (session → venue).
-     * Small tilt from detection noise is removed so the venue stays level: only yaw and translation remain.
+     * Only the sign's direction (yaw) and its center are used, so the venue stays level and a tilted sign can't move it.
      */
-    fun alignment(markerInSession: Mat4, markerInVenue: Mat4): Mat4 =
-        levelled(markerInSession * markerInVenue.inverse())
+    fun alignment(markerInSession: Mat4, markerInVenue: Mat4): Mat4 {
+        val full = markerInSession * markerInVenue.inverse()
+        // Keep only the turn about the vertical axis (read from the sign's horizontal "right" direction, which a sign
+        // leaning back does not change).
+        val yawOnly = levelled(full)
+        val rotation = Mat4.fromColumns(yawOnly.column(0), yawOnly.column(1), yawOnly.column(2), Vec3.ZERO)
+        // Place the venue so the sign's CENTER lands exactly where it was seen, using only that yaw. Taking the
+        // translation of `full` instead would carry the sign's tilt (e.g. a laptop screen leaning back by 15°) into the
+        // venue origin through the sign's height above the floor: 1.4 m × sin 15° ≈ 0.36 m of sideways error, different
+        // every time the sign is tilted differently.
+        val origin = markerInSession.translation - rotation.transformPoint(markerInVenue.translation)
+        return Mat4.fromColumns(rotation.column(0), rotation.column(1), rotation.column(2), origin)
+    }
 
     /** Keeps only the rotation around the vertical axis (and the translation) of a transform. */
     fun levelled(transform: Mat4): Mat4 {
