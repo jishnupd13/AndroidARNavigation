@@ -89,7 +89,7 @@ data class UserPose(val position: Vec3, val forward: Vec3)
  */
 class NavigationController(
     val pkg: VenuePackage,
-    val destination: Venue.POI,
+    initialDestination: Venue.POI,
     val profile: RouteProfile,
     var listener: WayFinderNavigationListener? = null,
     private val languages: List<String>? = null,
@@ -103,6 +103,13 @@ class NavigationController(
     private val planner = RoutePlanner(venue)
     private var tracker: NavigationTracker? = null
     private val alignmentFilter = AlignmentFilter()
+
+    var destination: Venue.POI by mutableStateOf(initialDestination)
+        private set
+
+    /** The most recently recognized reference point / sign. */
+    var lastAlignedMarker: Venue.Marker? by mutableStateOf(null)
+        private set
 
     var uiState by mutableStateOf(NavigationUiState())
         private set
@@ -159,14 +166,27 @@ class NavigationController(
         // A recorded path is only accurate relative to the sign it was recorded from. Another sign is placed in the
         // venue by its surveyed position, which for a sign hung wherever it was convenient is wrong by far more than
         // the path's own accuracy, and blending it in would pull everything out of place. So it is not used.
-        if (recordedFromMarkerId.isNotEmpty() && marker.id != recordedFromMarkerId) {
+        val isCapturedRef = marker.id.startsWith("ref-")
+        val recordedMarkerExists = recordedFromMarkerId.isNotEmpty() && venue.marker(recordedFromMarkerId) != null
+        if (recordedMarkerExists && marker.id != recordedFromMarkerId && !isCapturedRef) {
             if (!alignmentFilter.isAligned) showAlignmentPrompt(recordedSignPrompt())
             return
         }
         val candidate = MarkerAlignment.alignment(markerInSession, MarkerAlignment.transform(marker))
         // Sightings are blended in by distance (close-ups count more) and only applied when they move the alignment
-        // by a meaningful amount, so the scene doesn't jitter.
-        val changed = alignmentFilter.update(candidate, distanceMeters, viewCosine, cameraInSession)
+        // by a meaningful amount, so the scene doesn't jitter. Captured photo reference points lock in on first match.
+        val changed = if (isCapturedRef && !alignmentFilter.isLockedIn) {
+            var anyChanged = false
+            repeat(AlignmentFilter.LOCK_IN_SIGHTINGS) {
+                if (alignmentFilter.update(candidate, 1f, 1f, null)) anyChanged = true
+            }
+            anyChanged
+        } else {
+            val effectiveDistance = if (isCapturedRef) distanceMeters.coerceAtMost(AlignmentFilter.CLOSE_DISTANCE_M) else distanceMeters
+            val effectiveCosine = if (isCapturedRef) viewCosine.coerceAtLeast(AlignmentFilter.MIN_FRONTAL_COSINE) else viewCosine
+            val effectiveCamera = if (isCapturedRef) null else cameraInSession
+            alignmentFilter.update(candidate, effectiveDistance, effectiveCosine, effectiveCamera)
+        }
         if (changed) alignment = alignmentFilter.alignment
         // The first sighting can come from several meters away, where a sign's pose is least precise. Wait for a few
         // close-up ones before drawing anything, so everything starts out accurately placed.
@@ -180,16 +200,40 @@ class NavigationController(
         val isFirstAlignment = !isAligned
         if (!isFirstAlignment && !changed) return
         isAligned = true
+        lastAlignedMarker = marker
         currentLevel = marker.level
         if (isFirstAlignment || uiState.route == null) {
             needsRoute = true
             uiState = uiState.copy(isAligned = true, alignmentPrompt = null)
-            showToast("Found “${resolve(marker.name)}”. Follow the arrows.")
+            showToast("Matched “${resolve(marker.name)}”. Follow the arrows or pick a destination above.")
 
         } else {
             uiState = uiState.copy(isAligned = true)
         }
         listener?.onAligned(marker)
+    }
+
+    /** Changes the target destination dynamically within the same AR camera session without restarting tracking. */
+    fun selectDestination(newDestination: Venue.POI) {
+        destination = newDestination
+        hasArrived = false
+        arrivedSince = null
+        offRouteSince = null
+        val pos = lastPosition
+        val lvl = currentLevel ?: newDestination.level
+        if (isAligned && pos != null) {
+            uiState = uiState.copy(arrival = null)
+            planRoute(pos, lvl, rerouted = false)
+            showToast("Navigating to “${resolve(newDestination.name)}”", 2_500)
+        } else {
+            needsRoute = true
+            uiState = uiState.copy(route = null, arrival = null)
+        }
+    }
+
+    /** Clears the arrival overlay so the user stays in the live camera view and can select another destination. */
+    fun dismissArrival() {
+        uiState = uiState.copy(arrival = null)
     }
 
     /**
@@ -305,9 +349,12 @@ class NavigationController(
         val start = Vec3(position.x, floor, position.z)
         val goal = Vec3(destination.x, floor, destination.z)
         val points = walkedPoints.filter { it.level == level }
-        return when (val result = WalkedPathRouter(destinationJoinDistance = 3f).route(start, goal, points)) {
+        return when (val result = WalkedPathRouter(startJoinDistance = 5f, destinationJoinDistance = 4f).route(start, goal, points)) {
             is WalkedRouteResult.Success -> planner.routeAlong(result.points, level, profile)
-            is WalkedRouteResult.Failure -> throw RoutingError.Other(result.error.message)
+            is WalkedRouteResult.Failure -> {
+                val direct = com.app.androidnativearcore.wayfinder.core.straightWalk(start, goal, "direct", level, floor).map { it.position } + goal
+                planner.routeAlong(direct, level, profile)
+            }
         }
     }
 

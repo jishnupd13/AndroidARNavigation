@@ -3,18 +3,25 @@ package com.app.androidnativearcore.wayfinder.ar
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -23,23 +30,31 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.app.androidnativearcore.wayfinder.core.CustomDestination
+import com.app.androidnativearcore.wayfinder.core.LocalizedText
 import com.app.androidnativearcore.wayfinder.core.Mat4
+import com.app.androidnativearcore.wayfinder.core.PlacedObject
+import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
+import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
+import com.app.androidnativearcore.wayfinder.core.WalkedPoint
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.math.Position
+import kotlin.math.hypot
 
 /**
- * Full-screen AR navigation to a POI (iOS `WayFinderNavigationViewController`).
+ * Full-screen AR navigation & live room view:
  *
- * 1. The user points the camera at any of the venue's AR signs (markers). The session is aligned so that
- *    venue coordinates map onto the real world.
- * 2. A route is planned from the user's position and drawn as floor arrows, with a destination pin, POI labels,
- *    a mini map and turn-by-turn instructions.
- * 3. Every sign seen on the way corrects drift. Leaving the route triggers rerouting; reaching the destination
- *    shows an arrival screen.
+ * - Keeps the user in the live AR camera view at all times after matching a reference point.
+ * - Shows **"You are currently at: <Reference Point>"** at the top of the camera view, paired with a **Dropdown**
+ *   of all available destinations, reference points (`📍`), and placed objects (`☕`/`🎁`/`⭐`/`🎈`/`💬`), sorted
+ *   by distance.
+ * - Dynamically renders **all reference points with blue pins & blue text labels** (`ReferencePointsScene`) and
+ *   **all placed objects** (`ObjectsScene`) in the live camera video alongside the 3D route arrows (`RouteScene`).
  */
 @Composable
 fun WayFinderNavigationScreen(
@@ -49,36 +64,100 @@ fun WayFinderNavigationScreen(
     listener: WayFinderNavigationListener? = null,
     languages: List<String>? = null,
     /** Paths people walked while adding destinations; routes to those destinations follow them. */
-    walkedPoints: List<com.app.androidnativearcore.wayfinder.core.WalkedPoint> = emptyList(),
-    /** Objects placed while recording; those belonging to this destination are shown along the way. */
-    placedObjects: List<com.app.androidnativearcore.wayfinder.core.PlacedObject> = emptyList(),
+    walkedPoints: List<WalkedPoint> = emptyList(),
+    /** Objects placed while recording; all objects are rendered in the live camera video. */
+    placedObjects: List<PlacedObject> = emptyList(),
     /** The sign this destination's path was recorded from, if known. */
     recordedFromMarkerId: String = "",
     modifier: Modifier = Modifier,
     debug: Boolean = false,
 ) {
-    val destination = pkg.venue.poi(destinationId)
-    if (destination == null) {
-        Box(modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
-            Text("Unknown destination '$destinationId'.", color = Color.White)
-        }
-        return
-    }
+    val venue = pkg.venue
+    val defaultLevel = venue.levels.firstOrNull()?.id.orEmpty()
+    val initialDest = venue.poi(destinationId)
+        ?: venue.pois.firstOrNull { it.category == CustomDestination.CATEGORY }
+        ?: venue.pois.firstOrNull()
+        ?: Venue.POI(
+            id = "default-poi",
+            name = LocalizedText("Room"),
+            category = CustomDestination.CATEGORY,
+            level = defaultLevel,
+            x = 0f,
+            z = 0f,
+            node = "",
+        )
 
-    val controller = remember(pkg, destinationId, profile, walkedPoints) {
-        NavigationController(pkg, destination, profile, listener, languages, walkedPoints, recordedFromMarkerId)
+    val controller = remember(pkg, profile, walkedPoints) {
+        NavigationController(pkg, initialDest, profile, listener, languages, walkedPoints, recordedFromMarkerId)
     }
     controller.listener = listener
+    LaunchedEffect(destinationId) {
+        venue.poi(destinationId)?.let {
+            if (it.id != controller.destination.id) {
+                controller.selectDestination(it)
+            }
+        }
+    }
+
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
     val state = controller.uiState
+    val activeDestination = controller.destination
     val signs = remember(pkg) {
-        pkg.venue.markers.take(6).mapNotNull { marker ->
+        pkg.venue.markers.take(8).mapNotNull { marker ->
             BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
         }
     }
     var showFeedback by remember { mutableStateOf(false) }
+    var dropdownExpanded by remember { mutableStateOf(false) }
 
-    // Keep the screen awake while navigating (iOS: isIdleTimerDisabled).
+    // Reference points to render in blue in the live camera video
+    val refPins = remember(venue.markers) {
+        venue.markers.filter { it.id.startsWith("ref-") }.map {
+            RefPin(it.x, it.y, it.z, it.name.resolved())
+        }
+    }
+
+    // Current reference point name ("You are currently at")
+    val userPos = state.user?.position
+    val currentAtName = remember(controller.lastAlignedMarker, userPos, refPins) {
+        val nearestRef = if (userPos != null) {
+            refPins.minByOrNull { hypot(it.x - userPos.x, it.z - userPos.z) }
+                ?.takeIf { hypot(it.x - userPos.x, it.z - userPos.z) <= 2.5f }
+        } else null
+        nearestRef?.name
+            ?: controller.lastAlignedMarker?.name?.resolved()
+            ?: "Scan a reference point / sign"
+    }
+
+    // Build all navigable POIs (saved destinations, reference points, placed objects, venue POIs), nearest first
+    val availableTargets = remember(venue.pois, placedObjects, userPos) {
+        val objectPois = placedObjects.filter { !it.isReference }.map { obj ->
+            val label = obj.text.ifBlank { obj.kind.label }
+            Venue.POI(
+                id = "objpoi-${obj.id}",
+                name = LocalizedText("${obj.kind.glyph} $label"),
+                category = CustomDestination.CATEGORY,
+                level = obj.level.ifEmpty { defaultLevel },
+                x = obj.x,
+                z = obj.z,
+                node = "",
+                elevation = obj.y,
+            )
+        }
+        val combined = venue.pois + objectPois
+        if (userPos != null) {
+            combined.sortedWith(
+                compareBy(
+                    { it.category != CustomDestination.CATEGORY && it.category != REFERENCE_CATEGORY },
+                    { hypot(it.x - userPos.x, it.z - userPos.z) },
+                ),
+            )
+        } else {
+            combined.sortedBy { it.category != CustomDestination.CATEGORY && it.category != REFERENCE_CATEGORY }
+        }
+    }
+
+    // Keep the screen awake while navigating
     val view = LocalView.current
     DisposableEffect(view) {
         view.keepScreenOn = true
@@ -89,8 +168,6 @@ fun WayFinderNavigationScreen(
     Box(modifier.fillMaxSize().background(Color.Black)) {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
-            // The default picks the highest-resolution camera config, which can starve motion tracking on mid-range
-            // phones; ARCore's own default config is the safer choice for navigation.
             sessionCameraConfig = null,
             sessionConfiguration = { session, config ->
                 markerTracker.configure(session, config)
@@ -100,7 +177,7 @@ fun WayFinderNavigationScreen(
             },
             onSessionUpdated = { _, frame ->
                 val now = frame.timestamp / 1_000_000
-                for (sighting in markerTracker.sightings(frame, now, if (controller.isLockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else 500L)) {
+                for (sighting in markerTracker.sightings(frame, now, if (controller.isLockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else 300L)) {
                     controller.onMarkerDetected(sighting.marker, sighting.markerInSession, sighting.distanceMeters, sighting.cameraInSession, sighting.viewCosine)
                 }
                 val matrix = FloatArray(16)
@@ -109,23 +186,128 @@ fun WayFinderNavigationScreen(
             },
             onSessionFailed = { error -> controller.showToast("AR isn't available: ${error.message}", 8_000) },
         ) {
+            val camPosProvider = { controller.cameraSessionPosition.let { Position(it.x, it.y, it.z) } }
             RouteScene(
                 route = state.route,
                 level = state.renderedLevel,
                 venue = pkg.venue,
-                destination = destination,
+                destination = activeDestination,
                 alignment = controller.alignment,
-                cameraPosition = { controller.cameraSessionPosition.let { Position(it.x, it.y, it.z) } },
+                cameraPosition = camPosProvider,
                 languages = languages,
             )
+            // Render ALL placed objects in the room so the user sees them in the live video as on the map
             ObjectsScene(
-                objects = remember(placedObjects, destinationId) { placedObjects.filter { it.destinationId == destinationId } },
+                objects = placedObjects,
                 alignment = controller.alignment,
-                cameraPosition = { controller.cameraSessionPosition.let { Position(it.x, it.y, it.z) } },
+                cameraPosition = camPosProvider,
+            )
+            // Render ALL reference points with blue pins and blue text labels in the live video
+            ReferencePointsScene(
+                points = refPins,
+                alignment = controller.alignment,
+                cameraPosition = camPosProvider,
             )
         }
 
-        Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
+        Column(
+            Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            // Top bar: "You are currently at" + Dropdown for available navigations
+            Column(
+                Modifier.fillMaxWidth()
+                    .background(Color(0xCC1C1C1E), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text("You are currently at", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                Text(
+                    "📍 $currentAtName",
+                    color = Color(0xFF0A84FF),
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+
+                // Destination / Reference Point / Object Dropdown
+                Box(Modifier.fillMaxWidth()) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .background(Color(0xFF2C2C2E), RoundedCornerShape(10.dp))
+                            .clickable { dropdownExpanded = true }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        val distText = userPos?.let {
+                            " · %.1f m".format(hypot(activeDestination.x - it.x, activeDestination.z - it.z))
+                        }.orEmpty()
+                        val glyph = when {
+                            activeDestination.id.startsWith("objpoi-") -> ""
+                            activeDestination.category == REFERENCE_CATEGORY -> "📍 "
+                            activeDestination.category == CustomDestination.CATEGORY -> "⭐ "
+                            else -> "🏁 "
+                        }
+                        Text(
+                            "Navigate to: $glyph${activeDestination.name.resolved()}$distText",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text("▾", color = Color(0xFF0A84FF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    DropdownMenu(
+                        expanded = dropdownExpanded,
+                        onDismissRequest = { dropdownExpanded = false },
+                        modifier = Modifier.fillMaxWidth(0.9f).heightIn(max = 340.dp),
+                    ) {
+                        availableTargets.forEach { poi ->
+                            val isRef = poi.category == REFERENCE_CATEGORY
+                            val isObj = poi.id.startsWith("objpoi-")
+                            val glyph = when {
+                                isObj -> ""
+                                isRef -> "📍 "
+                                poi.category == CustomDestination.CATEGORY -> "⭐ "
+                                else -> "🏁 "
+                            }
+                            val sub = when {
+                                isObj -> "Placed object"
+                                isRef -> "Reference point"
+                                poi.category == CustomDestination.CATEGORY -> "Saved destination"
+                                else -> "Venue destination"
+                            }
+                            val dist = userPos?.let { hypot(poi.x - it.x, poi.z - it.z) }
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Column(Modifier.weight(1f)) {
+                                            Text(
+                                                "$glyph${poi.name.resolved()}",
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = if (isRef) Color(0xFF0A84FF) else Color.Unspecified,
+                                            )
+                                            Text(sub, fontSize = 12.sp, color = Color.Gray)
+                                        }
+                                        if (dist != null) {
+                                            Text("%.1f m".format(dist), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    dropdownExpanded = false
+                                    controller.selectDestination(poi)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+
             state.banner?.let { GuidanceBannerView(it) }
             state.alignmentPrompt?.let { AlignmentPromptView(it, signs) }
         }
@@ -151,10 +333,11 @@ fun WayFinderNavigationScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             ToastHost(state.toast)
-            MiniMapView(state.route, state.renderedLevel, destination, pkg.venue, state.user)
+            MiniMapView(state.route, state.renderedLevel, activeDestination, pkg.venue, state.user)
         }
 
-        state.arrival?.let { ArrivalOverlay(it, onDone = controller::finish) }
+        // Dismissing arrival keeps the user in the live camera view so they can pick another destination from the dropdown!
+        state.arrival?.let { ArrivalOverlay(it, onDone = controller::dismissArrival) }
     }
 
     if (showFeedback) {

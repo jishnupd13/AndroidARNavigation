@@ -179,7 +179,14 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
      * around it and the middle one is used, so a single noisy depth sample (or the edge of an object) can't throw
      * the position off. Needs [configure] with `aiming = true`.
      */
-    fun surfaceAt(frame: Frame, session: Session, xPx: Float, yPx: Float, maxDistanceM: Float = 6f): SurfaceHit? {
+    fun surfaceAt(
+        frame: Frame,
+        session: Session,
+        xPx: Float,
+        yPx: Float,
+        maxDistanceM: Float = 6f,
+        preferPlane: Boolean = true,
+    ): SurfaceHit? {
         fun usable(result: HitResult): Boolean {
             val trackable = result.trackable
             return result.distance <= maxDistanceM && when (trackable) {
@@ -192,8 +199,16 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
         fun position(p: com.google.ar.core.Pose) = Vec3(p.tx(), p.ty(), p.tz())
 
         val atTap = frame.hitTest(xPx, yPx).filter(::usable)
-        atTap.firstOrNull { it.trackable is Plane }?.let { plane ->
-            return SurfaceHit(position(plane.hitPose), isPlane = true) { plane.createAnchor() }
+        if (preferPlane) {
+            atTap.firstOrNull { it.trackable is Plane }?.let { plane ->
+                return SurfaceHit(position(plane.hitPose), isPlane = true) { plane.createAnchor() }
+            }
+        } else {
+            // When capturing a foreground object (e.g. a bottle on a table), pick the closest hit so we don't
+            // measure the background plane behind the object.
+            atTap.minByOrNull { it.distance }?.let { closest ->
+                return SurfaceHit(position(closest.hitPose), isPlane = closest.trackable is Plane) { closest.createAnchor() }
+            }
         }
         val spread = 12f
         val samples = listOf(0f to 0f, spread to 0f, -spread to 0f, 0f to spread, 0f to -spread).mapNotNull { (dx, dy) ->

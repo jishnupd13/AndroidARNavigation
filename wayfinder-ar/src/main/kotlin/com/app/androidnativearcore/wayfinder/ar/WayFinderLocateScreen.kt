@@ -37,7 +37,7 @@ data class LocatedUser(
 )
 
 /** While locking onto a reference point, re-detect it this often. */
-private const val LOCATE_INTERVAL_MS = 300L
+private const val LOCATE_INTERVAL_MS = 120L
 
 /**
  * Full-screen camera that recognizes any of the venue's reference points and reports where the user stands.
@@ -91,7 +91,16 @@ fun WayFinderLocateScreen(
                     if (matched != null && matched?.id != sighting.marker.id && !filter.isLockedIn) filter.reset()
                     matched = sighting.marker
                     val candidate = MarkerAlignment.alignment(sighting.markerInSession, MarkerAlignment.transform(sighting.marker))
-                    filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, sighting.cameraInSession)
+                    val isCapturedRef = sighting.marker.id.startsWith("ref-")
+                    if (isCapturedRef) {
+                        // Captured photo reference points can be harder for ARCore to hold in FULL_TRACKING across
+                        // multiple viewpoints; lock in immediately once ARCore recognizes the image.
+                        repeat(AlignmentFilter.LOCK_IN_SIGHTINGS) {
+                            filter.update(candidate, 1f, 1f, null)
+                        }
+                    } else {
+                        filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, sighting.cameraInSession)
+                    }
                     progress = filter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)
                     if (filter.isLockedIn) {
                         val camera = frame.camera.pose

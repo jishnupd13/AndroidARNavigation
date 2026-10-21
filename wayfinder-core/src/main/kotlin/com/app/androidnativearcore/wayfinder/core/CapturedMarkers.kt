@@ -15,7 +15,8 @@ fun Venue.withExtraMarkers(extra: List<Venue.Marker>): Venue {
     val existingIDs = markers.map { it.id }.toSet()
     val additions = extra.filter { it.level in levelIDs && it.id !in existingIDs && it.physicalWidth > 0f }
     if (additions.isEmpty()) return this
-    return copy(markers = markers + additions)
+    // Place captured reference points first so camera prompt banners (.take(6)/.take(8)) always show them.
+    return copy(markers = additions + markers)
 }
 
 /** A captured reference point on disk: the venue it belongs to and its marker (whose [Venue.Marker.image] is an
@@ -44,19 +45,30 @@ class CapturedMarkerStore(private val directory: File) {
                 runCatching { json.decodeFromString(StoredMarker.serializer(), file.readText()) }.getOrNull()
             }
             .filter { it.venueId == venueId }
-            .map { it.marker }
+            .map {
+                val raw = File(it.marker.image)
+                val resolved = if (raw.isAbsolute && raw.exists()) raw else imageFile(it.marker.id)
+                it.marker.copy(image = resolved.absolutePath)
+            }
             .filter { File(it.image).exists() }
 
     fun save(venueId: String, marker: Venue.Marker) {
         val target = File(directory, "${marker.id}.json")
         val tmp = File(directory, "${marker.id}.json.tmp")
-        tmp.writeText(json.encodeToString(StoredMarker.serializer(), StoredMarker(venueId, marker)))
+        val portable = marker.copy(image = imageFile(marker.id).name)
+        tmp.writeText(json.encodeToString(StoredMarker.serializer(), StoredMarker(venueId, portable)))
         tmp.renameTo(target)
     }
 
     fun delete(id: String) {
         File(directory, "$id.json").delete()
         imageFile(id).delete()
+    }
+
+    /** Removes every captured reference point (all metadata and images). */
+    fun clear() {
+        directory.listFiles { f -> f.isFile && (f.name.endsWith(".json") || f.name.endsWith(".png")) }
+            .orEmpty().forEach { it.delete() }
     }
 }
 

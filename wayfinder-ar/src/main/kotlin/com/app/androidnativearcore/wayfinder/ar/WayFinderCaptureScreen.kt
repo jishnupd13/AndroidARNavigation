@@ -17,17 +17,23 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -44,31 +50,41 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.ar.core.AugmentedImageDatabase
-import kotlin.math.atan2
-import kotlin.math.min
 import com.app.androidnativearcore.wayfinder.core.AlignmentFilter
 import com.app.androidnativearcore.wayfinder.core.AlignmentTrack
+import com.app.androidnativearcore.wayfinder.core.CustomDestination
+import com.app.androidnativearcore.wayfinder.core.LocalizedText
 import com.app.androidnativearcore.wayfinder.core.MarkerAlignment
 import com.app.androidnativearcore.wayfinder.core.Mat4
 import com.app.androidnativearcore.wayfinder.core.PlacedObject
 import com.app.androidnativearcore.wayfinder.core.PlacedObjectKind
+import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
+import com.app.androidnativearcore.wayfinder.core.Route
+import com.app.androidnativearcore.wayfinder.core.RoutePlanner
+import com.app.androidnativearcore.wayfinder.core.RouteProfile
 import com.app.androidnativearcore.wayfinder.core.SessionPathRecorder
 import com.app.androidnativearcore.wayfinder.core.Vec3
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
+import com.app.androidnativearcore.wayfinder.core.WalkedPathRouter
 import com.app.androidnativearcore.wayfinder.core.WalkedPoint
+import com.app.androidnativearcore.wayfinder.core.WalkedRouteResult
+import com.app.androidnativearcore.wayfinder.core.followsWalkedPaths
 import com.app.androidnativearcore.wayfinder.core.objectScaleFor
 import com.app.androidnativearcore.wayfinder.core.spreadObjectPosition
 import com.app.androidnativearcore.wayfinder.core.straightWalk
 import com.app.androidnativearcore.wayfinder.core.toVenue
 import com.app.androidnativearcore.wayfinder.core.toWalkedPoints
 import com.google.ar.core.Anchor
+import com.google.ar.core.AugmentedImageDatabase
 import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.math.Position
+import kotlin.math.atan2
 import kotlin.math.hypot
+import kotlin.math.min
+import kotlinx.coroutines.delay
 
 /**
  * A spot the user chose, in venue coordinates, with the walk that leads to it from the sign they scanned and the
@@ -127,6 +143,19 @@ private class RefCapture(
     val distanceM: Float,
 )
 
+/** An entry in the in-camera navigation dropdown (destination, reference point, or placed object). */
+private data class AdminNavTarget(
+    val id: String,
+    val label: String,
+    val glyph: String,
+    val subtitle: String,
+    val level: String,
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val poi: Venue.POI? = null,
+)
+
 /** Degrees to rotate the sensor-landscape camera image so it is upright for the current display orientation. */
 private fun displayRotationDegrees(view: android.view.View): Int = when (view.display?.rotation) {
     Surface.ROTATION_90 -> 0
@@ -135,8 +164,14 @@ private fun displayRotationDegrees(view: android.view.View): Int = when (view.di
     else -> 90
 }
 
+/** Auto-capture a reference point roughly every this many metres walked (when the toggle is on). */
+private const val AUTO_INTERVAL_M = 3f
+
+/** Don't auto-capture two reference points closer together than this. */
+private const val AUTO_MIN_SEPARATION_M = 2f
+
 /** Shortest recorded walk (meters) that is worth saving as a route. */
-private const val MIN_PATH_LENGTH_M = 1f
+private const val MIN_PATH_LENGTH_M = 0.3f
 
 /** Objects can be placed on surfaces up to this far away. */
 private const val MAX_OBJECT_DISTANCE_M = 6f
@@ -175,7 +210,7 @@ private const val TRACKING_LOST_RESET_MS = 3_000L
 /** While locking onto the sign, re-detect it this often (the navigation screen uses a slower 1.5 s). */
 private const val LOCK_IN_INTERVAL_MS = 400L
 
-/** The user's latest pose, written every frame but read only on taps and saves, so it never triggers a redraw. */
+/** The user's latest pose, written every frame. */
 private class LiveUser {
     var valid = false
     var session = Vec3.ZERO
@@ -186,17 +221,15 @@ private class LiveUser {
 }
 
 /**
- * Full-screen AR "Add destination", the Android port of the iOS prototype's recording mode:
+ * Full-screen AR "Add destination" & live Admin authoring screen:
  *
- * 1. The user scans an AR sign. After a moment of close-up sightings the alignment is locked in and **recording
- *    starts**.
- * 2. They walk to the destination, picking objects from the bar at the bottom and **tapping the screen** where each
- *    one goes. Scanning a sign again on the way (for example at the end) corrects the drift ARCore built up: the
- *    path is converted with an alignment that follows the scans along the walk.
- * 3. The walk and the objects are recorded in the AR session's own (stable) frame, like iOS anchors, and converted
- *    to venue coordinates once, with the best alignment, when **Save destination here** is tapped. The destination
- *    is set automatically: it is where the user stands when saving. Routes to it follow the walked path (around
- *    walls).
+ * - All action buttons (`✕ Cancel`, `⊕ Start here`, `◎ Add point`, `☰ Points`, `◳ Objects`, `ObjectBar`,
+ *   `Save destination here`, `Auto points`) are ALWAYS visible so the admin can capture reference points, place
+ *   objects, or save destinations at any moment.
+ * - Shows a live top bar with **"You are currently at: <Reference Point>"** and a **Dropdown** of all available
+ *   destinations, reference points, and placed objects to preview 3D AR navigation routes right inside the camera.
+ * - Dynamically renders all reference points in **blue** (`ReferencePointsScene`) and all placed objects
+ *   (`ObjectsScene`) in the live camera video.
  */
 @Composable
 fun WayFinderCaptureScreen(
@@ -206,9 +239,15 @@ fun WayFinderCaptureScreen(
     modifier: Modifier = Modifier,
     /** Called when the admin captures and confirms a reference point; the caller persists it. */
     onSaveReferencePoint: (CapturedReferencePoint) -> Unit = {},
+    /** Previously saved walked points from earlier destinations, for live in-camera routing preview. */
+    existingWalkedPoints: List<WalkedPoint> = emptyList(),
+    /** Previously saved 3D objects from earlier destinations, rendered in the live camera video. */
+    existingObjects: List<PlacedObject> = emptyList(),
 ) {
     val venue = pkg.venue
+    val defaultLevel = venue.levels.firstOrNull()?.id.orEmpty()
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
+    val planner = remember(venue) { RoutePlanner(venue) }
     val signs = remember(pkg) {
         venue.markers.take(6).mapNotNull { marker ->
             BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
@@ -218,49 +257,78 @@ fun WayFinderCaptureScreen(
     // --- Recording state ---
     val filter = remember(pkg) { AlignmentFilter() }
     var alignment by remember { mutableStateOf(Mat4.IDENTITY) }
-    var startMarker by remember { mutableStateOf<Venue.Marker?>(null) } // the sign the walk starts from
+    var startMarker by remember {
+        mutableStateOf<Venue.Marker?>(
+            Venue.Marker(
+                id = "origin-bootstrap", name = LocalizedText("Start point"), image = "",
+                physicalWidth = 0.2f, level = defaultLevel, x = 0f, y = PHONE_HEIGHT_M, z = 0f, facing = 0f,
+                mounting = Venue.MarkerMounting.WALL,
+            ),
+        )
+    }
     val recorder = remember(pkg) { SessionPathRecorder() }
     // Segments already converted to venue coordinates (when tracking was lost, the old session frame is gone).
     val committedPath = remember(pkg) { mutableListOf<WalkedPoint>() }
     val committedObjects = remember(pkg) { mutableStateListOf<PlacedObject>() }
     // Objects placed since the last commit, in session coordinates (so no alignment change can shift them).
     val sessionObjects = remember(pkg) { mutableStateListOf<PlacedObject>() }
+    // Reference points captured this session (venue coordinates), shown as blue pins in the camera.
+    val sessionRefPins = remember(pkg) { mutableStateListOf<RefPin>() }
+    // Destinations saved during this camera session (so they immediately appear in the dropdown without leaving camera).
+    val sessionSavedDestinations = remember(pkg) { mutableStateListOf<Venue.POI>() }
     // ARCore keeps anchors glued to the real world as its tracking improves; objects follow their anchors.
     val anchors = remember(pkg) { HashMap<String, Anchor>() }
     val camera = remember { FloatArray(3) }       // camera position in the session
     val user = remember { LiveUser() }
     val pendingTap = remember { FloatArray(3) }   // x, y, and 1 when a tap waits to be handled in the next frame
     var lostSince by remember { mutableStateOf<Long?>(null) }
-    // Every scan of a sign, with how far the walk had got. Their alignments are interpolated along the walk to remove drift.
     val visits = remember(pkg) { mutableListOf<Visit>() }
-    val otherSignToastMs = remember { LongArray(1) } // when the "scan the same sign" hint was last shown
-    val objectProgress = remember(pkg) { HashMap<String, Float>() } // how far the walk had got when each object was placed
-    val driftCm = remember { FloatArray(1) }                         // the most drift a re-scan has corrected so far
-    val recent = remember(pkg) { ArrayDeque<Vec3>() }       // the phone's latest positions, to tell when it is held steady
-    val floorSamples = remember(pkg) { ArrayDeque<Float>() } // recent floor heights (session frame) from detected planes
+    val otherSignToastMs = remember { LongArray(1) }
+    val objectProgress = remember(pkg) { HashMap<String, Float>() }
+    val driftCm = remember { FloatArray(1) }
+    val recent = remember(pkg) { ArrayDeque<Vec3>() }
+    val floorSamples = remember(pkg) { ArrayDeque<Float>() }
     val frameCounter = remember { IntArray(1) }
 
-    // --- What the user sees (only things that change rarely) ---
+    // --- What the user sees ---
     var lockedIn by remember { mutableStateOf(false) }
     var lockProgress by remember { mutableStateOf(0) }
-    var signAgreement by remember { mutableStateOf("") } // how well the sign sightings agree, e.g. "sign ±2 cm"
+    var signAgreement by remember { mutableStateOf("") }
     var levelName by remember { mutableStateOf("") }
     var recordedSummary by remember { mutableStateOf("") }
     var canSave by remember { mutableStateOf(false) }
     var steady by remember { mutableStateOf(false) }
-    var floorFound by remember { mutableStateOf(false) } // ARCore has measured the real floor
-    var pendingDestination by remember { mutableStateOf<Vec3?>(null) } // session position chosen when Save was tapped
+    var floorFound by remember { mutableStateOf(false) }
+    var pendingDestination by remember { mutableStateOf<Vec3?>(null) }
     var pendingLevel by remember { mutableStateOf("") }
     var pendingFloorSession by remember { mutableStateOf(0f) }
     var trackingMessage by remember { mutableStateOf<String?>("Starting the camera… move the phone slowly.") }
     var toast by remember { mutableStateOf<Toast?>(null) }
     var naming by remember { mutableStateOf(false) }
-    var selectedKind by remember { mutableStateOf(PlacedObjectKind.CUP) } // what the next tap places
-    // The object just placed, whose name the user can type in the box at the bottom (the name floats above it).
+    var selectedKind by remember { mutableStateOf(PlacedObjectKind.CUP) }
     var namingObjectId by remember { mutableStateOf<String?>(null) }
     var nameDraft by remember { mutableStateOf("") }
-    var pendingRef by remember { mutableStateOf<RefCapture?>(null) } // a captured reference point awaiting naming
-    val captureReq = remember { BooleanArray(1) }                    // set when the Add-reference-point button is tapped
+    var pendingRef by remember { mutableStateOf<RefCapture?>(null) }
+    val captureReq = remember { BooleanArray(1) }
+    var autoPoints by remember { mutableStateOf(false) }
+    val lastAutoProgress = remember { FloatArray(1) }
+    var lastAutoPos by remember { mutableStateOf<Vec3?>(null) }
+    val autoCount = remember { IntArray(1) }
+    var greenFlash by remember { mutableStateOf<String?>(null) }
+    // Auto-bootstrapped so all controls, tap-to-place, and reference point capture work immediately.
+    var bootstrapped by remember { mutableStateOf(true) }
+    var showPointsList by remember { mutableStateOf(false) }
+    var showObjectsList by remember { mutableStateOf(false) }
+
+    // --- Live "Currently at" & Dropdown Navigation state ---
+    var currentAtName by remember { mutableStateOf("Start point") }
+    var userVenuePos by remember { mutableStateOf(Vec3.ZERO) }
+    var navDropdownExpanded by remember { mutableStateOf(false) }
+    var selectedNavTarget by remember { mutableStateOf<AdminNavTarget?>(null) }
+    var activeRoute by remember { mutableStateOf<Route?>(null) }
+    var activeRouteDestPoi by remember { mutableStateOf<Venue.POI?>(null) }
+
+    LaunchedEffect(greenFlash) { if (greenFlash != null) { delay(1500); greenFlash = null } }
 
     val view = LocalView.current
     DisposableEffect(view) {
@@ -277,10 +345,6 @@ fun WayFinderCaptureScreen(
         toast = Toast((toast?.id ?: 0) + 1, message, durationMs)
     }
 
-    /**
-     * The real floor's height in the session frame: the middle of the recent plane-based estimates, or, until ARCore
-     * has found the floor, the phone's height minus a typical 1.4 m (what the iOS prototype does too).
-     */
     fun floorSessionY(): Float =
         floorSamples.sorted().let { if (it.isEmpty()) camera[1] - PHONE_HEIGHT_M else it[it.size / 2] }
 
@@ -288,12 +352,31 @@ fun WayFinderCaptureScreen(
 
     val hasUserObjects = sessionObjects.any { !it.isReference } || committedObjects.any { !it.isReference }
 
+    // Combine saved reference points from venue + newly captured reference points in this session (deduped by name/pos).
+    val allRefPins = remember(venue.markers, sessionRefPins.size) {
+        val fromVenue = venue.markers.filter { it.id.startsWith("ref-") }.map {
+            RefPin(it.x, it.y, it.z, it.name.resolved())
+        }
+        val combined = mutableListOf<RefPin>()
+        combined.addAll(fromVenue)
+        for (pin in sessionRefPins) {
+            if (combined.none { it.name == pin.name && hypot(it.x - pin.x, it.z - pin.z) < 0.2f }) {
+                combined.add(pin)
+            }
+        }
+        combined
+    }
+
+    // All venue-frame objects (saved from previous paths + committed in this session).
+    val allVenueObjects = remember(existingObjects, committedObjects.size) {
+        existingObjects + committedObjects
+    }
+
     fun committedLength(): Float =
         committedPath.zipWithNext().sumOf { (a, b) ->
             if (a.run == b.run && a.level == b.level) hypot(a.x - b.x, a.z - b.z).toDouble() else 0.0
         }.toFloat()
 
-    /** Moves each placed object to where ARCore now believes its anchor is (tracking refines it over time). */
     fun refreshFromAnchors() {
         for (index in sessionObjects.indices) {
             val obj = sessionObjects[index]
@@ -306,17 +389,11 @@ fun WayFinderCaptureScreen(
         }
     }
 
-    /** The alignment along the walk: one entry per scan of a sign that had a few close-up sightings. */
     fun buildTrack(): AlignmentTrack = AlignmentTrack().also { track ->
         visits.filter { it.filter.closeSightings >= 2 }.forEach { track.add(it.progress, it.filter.alignment) }
         if (track.isEmpty) track.add(0f, filter.alignment)
     }
 
-    /**
-     * Converts what was recorded in the session frame to venue coordinates and keeps it. Each point and object is
-     * converted with the alignment for the moment of the walk it belongs to, so drift between scans is corrected.
-     * Done when saving, and when tracking is lost (after which the session frame can't be trusted any more).
-     */
     fun commit() {
         val marker = startMarker ?: return
         val track = buildTrack()
@@ -324,8 +401,6 @@ fun WayFinderCaptureScreen(
         if (raw.isNotEmpty()) {
             val converted = raw.toWalkedPoints(venue, track, marker.level, floorSessionY())
             if (committedPath.isEmpty()) {
-                // Start the path at the sign itself, then straight to where the user first stood: they just looked at
-                // the sign, so the way between is clear. This lets routes begin at the sign later.
                 val first = converted.first()
                 val floor = first.y
                 val lead = straightWalk(Vec3(marker.x, floor, marker.z), Vec3(first.x, floor, first.z), first.run, first.level, floor)
@@ -346,11 +421,6 @@ fun WayFinderCaptureScreen(
         anchors.clear()
     }
 
-    /**
-     * What a tap does: puts the selected object where the user tapped. On a surface ARCore knows, it goes exactly
-     * there. Where ARCore knows no surface yet (blank wall, glass, a spot it hasn't scanned), it still goes somewhere
-     * sensible, on the floor along the tapped direction, and the user is told, so a tap is never ignored.
-     */
     fun handleTap(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session, x: Float, y: Float) {
         val cameraPosition = Vec3(camera[0], camera[1], camera[2])
         val hit = markerTracker.surfaceAt(frame, session, x, y, MAX_OBJECT_DISTANCE_M)
@@ -359,23 +429,18 @@ fun WayFinderCaptureScreen(
             val (origin, direction) = markerTracker.rayThrough(frame, x, y, view.width.toFloat(), view.height.toFloat())
             val floor = floorSessionY()
             val toFloor = if (direction.y < -0.05f) (floor - origin.y) / direction.y else -1f
-            // The floor if the tap points at it within reach; otherwise a spot 1.5 m along the tapped direction.
             val along = if (toFloor in 0.5f..MAX_OBJECT_DISTANCE_M) toFloor else 1.5f
             Vec3(origin.x + direction.x * along, if (toFloor in 0.5f..MAX_OBJECT_DISTANCE_M) floor else origin.y + direction.y * along, origin.z + direction.z * along)
         }
         val spot = spreadObjectPosition(wanted, sessionObjects.map { it.position }, MIN_OBJECT_SEPARATION_M)
         val id = "object-" + java.util.UUID.randomUUID()
-        // Anchor to the tapped surface itself; an object nudged off its spot, or placed without a surface, gets a
-        // free-standing anchor at its position.
         anchors[id] = if (hit != null && spot == hit.position) hit.createAnchor()
         else session.createAnchor(Pose(floatArrayOf(spot.x, spot.y, spot.z), floatArrayOf(0f, 0f, 0f, 1f)))
-        // Turn the object's front toward the user who is placing it.
         val yaw = Math.toDegrees(kotlin.math.atan2((cameraPosition.x - spot.x).toDouble(), (cameraPosition.z - spot.z).toDouble())).toFloat()
         val distance = spot.distanceTo(cameraPosition)
         objectProgress[id] = recorder.progress
         sessionObjects += PlacedObject(
             id = id, kind = selectedKind, level = "", x = spot.x, y = spot.y, z = spot.z, yawDegrees = yaw,
-            // A message needs words to show; anything else starts without a name until the user types one.
             text = if (selectedKind == PlacedObjectKind.MESSAGE) "Hello!" else "",
             createdAtMillis = System.currentTimeMillis(), scale = objectScaleFor(distance),
         )
@@ -383,38 +448,35 @@ fun WayFinderCaptureScreen(
         nameDraft = if (selectedKind == PlacedObjectKind.MESSAGE) "Hello!" else ""
         showToast(
             if (onSurface) "${selectedKind.label} added, %.1f m away".format(distance)
-            else "${selectedKind.label} added %.1f m away (no surface found there, so it is on the floor)".format(distance),
-            if (onSurface) 1_800 else 3_000,
+            else "${selectedKind.label} added %.1f m away (on floor)".format(distance),
+            if (onSurface) 1_800 else 2_500,
         )
     }
 
-    /**
-     * Grabs the current camera image of whatever the center of the screen is aimed at, estimates its real-world size
-     * (from depth distance and focal length) and its venue position, scores how trackable it looks, and offers it for
-     * saving as a reference point. Aim at a distinctive flat spot, ideally above head height.
-     */
-    fun captureReferencePoint(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
+    fun grabReference(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session): RefCapture? {
         val cameraPosition = Vec3(camera[0], camera[1], camera[2])
-        val hit = markerTracker.surfaceAt(frame, session, view.width / 2f, view.height / 2f, MAX_OBJECT_DISTANCE_M)
-        if (hit == null) {
-            showToast("Aim the center at a wall/feature within ${MAX_OBJECT_DISTANCE_M.toInt()} m, then capture.", 3_000)
-            return
+        val hit = markerTracker.surfaceAt(
+            frame, session, view.width / 2f, view.height / 2f, MAX_OBJECT_DISTANCE_M, preferPlane = false,
+        )
+        val hitPos = hit?.position ?: run {
+            val (origin, direction) = markerTracker.rayThrough(frame, view.width / 2f, view.height / 2f, view.width.toFloat(), view.height.toFloat())
+            Vec3(origin.x + direction.x * 1.2f, origin.y + direction.y * 1.2f, origin.z + direction.z * 1.2f)
         }
+        val cropFraction = 0.45f
         val bitmap = try {
             frame.acquireCameraImage().use { image ->
-                val full = CameraImage.toBitmap(image) ?: return showToast("Couldn't read the camera image. Try again.")
-                CameraImage.rotate(CameraImage.centerSquare(full, 0.6f), displayRotationDegrees(view))
+                val full = CameraImage.toBitmap(image)
+                CameraImage.rotate(CameraImage.centerSquare(full, cropFraction), displayRotationDegrees(view))
             }
         } catch (e: Exception) {
-            showToast("Hold still for a moment, then capture again.")
-            return
+            return null
         }
         val intrinsics = frame.camera.imageIntrinsics
         val fx = intrinsics.focalLength[0]
         val dims = intrinsics.imageDimensions
-        val cropSidePx = min(dims[0], dims[1]) * 0.6f
-        val distance = hit.position.distanceTo(cameraPosition)
-        val physicalWidth = (distance * cropSidePx / fx).coerceIn(0.05f, 3f)
+        val cropSidePx = min(dims[0], dims[1]) * cropFraction
+        val distance = hitPos.distanceTo(cameraPosition).coerceIn(0.3f, MAX_OBJECT_DISTANCE_M)
+        val physicalWidth = (distance * cropSidePx / fx).coerceIn(0.05f, 1.5f)
 
         val accepted = try {
             AugmentedImageDatabase(session).addImage("probe", bitmap, physicalWidth)
@@ -425,13 +487,205 @@ fun WayFinderCaptureScreen(
         val detail = CameraImage.detailScore(bitmap)
 
         val venueFromSession = filter.alignment.inverse()
-        val surfaceVenue = venueFromSession.transformPoint(hit.position)
+        val surfaceVenue = venueFromSession.transformPoint(hitPos)
         val cameraVenue = venueFromSession.transformPoint(cameraPosition)
         val facing = (Math.toDegrees(
             atan2((cameraVenue.x - surfaceVenue.x).toDouble(), (cameraVenue.z - surfaceVenue.z).toDouble()),
         ).toFloat() + 360f) % 360f
-        val level = user.level.ifEmpty { startMarker?.level ?: "" }
-        pendingRef = RefCapture(bitmap, physicalWidth, level, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z, facing, detail, accepted, distance)
+        val level = user.level.ifEmpty { startMarker?.level ?: defaultLevel }
+        return RefCapture(bitmap, physicalWidth, level, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z, facing, detail, accepted, distance)
+    }
+
+    fun captureReferencePoint(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
+        val ref = grabReference(frame, session)
+        if (ref == null) {
+            showToast("Camera image not ready yet — hold still and try again.", 2_500)
+            return
+        }
+        pendingRef = ref
+    }
+
+    fun toCaptured(ref: RefCapture, name: String) = CapturedReferencePoint(
+        name = name, image = ref.image, physicalWidth = ref.physicalWidth, level = ref.level,
+        x = ref.x, y = ref.y, z = ref.z, facing = ref.facing, mounting = Venue.MarkerMounting.WALL,
+    )
+
+    fun maybeAutoCapture(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
+        if (!autoPoints) return
+        if (recorder.progress - lastAutoProgress[0] < AUTO_INTERVAL_M) return
+        lastAutoProgress[0] = recorder.progress
+        val ref = grabReference(frame, session) ?: return
+        if (!ref.accepted) return
+        val last = lastAutoPos
+        if (last != null && hypot(ref.x - last.x, ref.z - last.z) < AUTO_MIN_SEPARATION_M) return
+        autoCount[0] = autoCount[0] + 1
+        val autoName = "Auto point ${autoCount[0]}"
+        onSaveReferencePoint(toCaptured(ref, autoName))
+        sessionRefPins.add(RefPin(ref.x, ref.y, ref.z, autoName))
+        currentAtName = autoName
+        lastAutoPos = Vec3(ref.x, ref.y, ref.z)
+        greenFlash = "Reference point added: $autoName"
+    }
+
+    fun startWithoutSign() {
+        val level = defaultLevel.ifEmpty { return }
+        val camSession = Vec3(camera[0], camera[1], camera[2])
+        val inVenue = filter.alignment.inverse().transformPoint(camSession)
+        startMarker = Venue.Marker(
+            id = "origin-bootstrap", name = LocalizedText("Start point"), image = "",
+            physicalWidth = 0.2f, level = level, x = inVenue.x, y = inVenue.y, z = inVenue.z, facing = 0f,
+            mounting = Venue.MarkerMounting.WALL,
+        )
+        currentAtName = "Start point"
+        bootstrapped = true
+        showToast("Started here — walk, add points or objects, and save!", 2_500)
+    }
+
+    fun guideToSession(target: Vec3, name: String) {
+        val cam = Vec3(camera[0], camera[1], camera[2])
+        val dx = target.x - cam.x
+        val dz = target.z - cam.z
+        val dist = hypot(dx, dz)
+        val fwd = user.forward
+        val dot = fwd.x * dx + fwd.z * dz
+        val cross = fwd.x * dz - fwd.z * dx
+        val dir = when {
+            dist < 0.8f -> "you're here"
+            dot <= 0f -> "behind you — turn around"
+            kotlin.math.abs(cross) < dist * 0.35f -> "straight ahead"
+            cross > 0f -> "ahead, on your left"
+            else -> "ahead, on your right"
+        }
+        showToast("$name · %.1f m · $dir".format(dist), 4_000)
+    }
+
+    /** Plans a live 3D route in the camera to the selected dropdown target. */
+    fun planToTarget(target: AdminNavTarget?) {
+        selectedNavTarget = target
+        if (target == null) {
+            activeRoute = null
+            activeRouteDestPoi = null
+            return
+        }
+        val level = user.level.ifEmpty { target.level.ifEmpty { defaultLevel } }
+        val floor = venue.level(level)?.elevation ?: 0f
+        val start = Vec3(user.venueX, floor, user.venueZ)
+        val goal = Vec3(target.x, floor, target.z)
+        val destPoi = target.poi ?: Venue.POI(
+            id = target.id,
+            name = LocalizedText(target.label),
+            category = CustomDestination.CATEGORY,
+            level = level,
+            x = target.x,
+            z = target.z,
+            node = "",
+            elevation = floor,
+        )
+        activeRouteDestPoi = destPoi
+
+        // Gather all walked points (saved + current session)
+        val track = buildTrack()
+        val currentWalked = recorder.points.toWalkedPoints(venue, track, level, floorSessionY())
+        val allWalked = (existingWalkedPoints + committedPath + currentWalked).filter { it.level == level }
+
+        val route = runCatching {
+            if (!destPoi.followsWalkedPaths && destPoi.node.isNotEmpty()) {
+                planner.route(start, level, toPOI = destPoi.id, profile = RouteProfile.FASTEST)
+            } else {
+                val res = WalkedPathRouter(startJoinDistance = 5f, destinationJoinDistance = 5f).route(start, goal, allWalked)
+                when (res) {
+                    is WalkedRouteResult.Success -> planner.routeAlong(res.points, level, RouteProfile.FASTEST)
+                    is WalkedRouteResult.Failure -> {
+                        val straight = straightWalk(start, goal, "direct", level, floor).map { it.position } + goal
+                        planner.routeAlong(straight, level, RouteProfile.FASTEST)
+                    }
+                }
+            }
+        }.getOrElse {
+            val straight = listOf(start, goal)
+            runCatching { planner.routeAlong(straight, level, RouteProfile.FASTEST) }.getOrNull()
+        }
+        activeRoute = route
+        guideToSession(alignment.transformPoint(Vec3(target.x, target.y, target.z)), target.label)
+    }
+
+    // Build all targets available in the navigation dropdown, sorted by distance from current user position.
+    val navTargets = remember(
+        venue.pois,
+        sessionSavedDestinations.size,
+        allRefPins.size,
+        allVenueObjects.size,
+        sessionObjects.size,
+        userVenuePos,
+    ) {
+        val list = mutableListOf<AdminNavTarget>()
+        val allPois = venue.pois + sessionSavedDestinations
+        for (poi in allPois) {
+            val glyph = when (poi.category) {
+                REFERENCE_CATEGORY -> "📍"
+                CustomDestination.CATEGORY -> "⭐"
+                else -> "🏁"
+            }
+            val sub = when (poi.category) {
+                REFERENCE_CATEGORY -> "Reference point"
+                CustomDestination.CATEGORY -> "Saved destination"
+                else -> "Venue destination"
+            }
+            list += AdminNavTarget(
+                id = poi.id,
+                label = poi.name.resolved(),
+                glyph = glyph,
+                subtitle = sub,
+                level = poi.level,
+                x = poi.x,
+                y = poi.elevation ?: 0f,
+                z = poi.z,
+                poi = poi,
+            )
+        }
+        for (pin in allRefPins) {
+            if (list.none { it.label.equals(pin.name, ignoreCase = true) && hypot(it.x - pin.x, it.z - pin.z) < 2f }) {
+                list += AdminNavTarget(
+                    id = "refpin-${pin.name}",
+                    label = pin.name,
+                    glyph = "📍",
+                    subtitle = "Reference point",
+                    level = defaultLevel,
+                    x = pin.x,
+                    y = pin.y,
+                    z = pin.z,
+                )
+            }
+        }
+        val venueFromSession = filter.alignment.inverse()
+        for (obj in allVenueObjects.filter { !it.isReference }) {
+            val label = obj.text.ifBlank { obj.kind.label }
+            list += AdminNavTarget(
+                id = obj.id,
+                label = label,
+                glyph = obj.kind.glyph,
+                subtitle = "Placed ${obj.kind.label}",
+                level = obj.level.ifEmpty { defaultLevel },
+                x = obj.x,
+                y = obj.y,
+                z = obj.z,
+            )
+        }
+        for (obj in sessionObjects.filter { !it.isReference }) {
+            val v = venueFromSession.transformPoint(obj.position)
+            val label = obj.text.ifBlank { obj.kind.label }
+            list += AdminNavTarget(
+                id = obj.id,
+                label = label,
+                glyph = obj.kind.glyph,
+                subtitle = "Placed ${obj.kind.label}",
+                level = defaultLevel,
+                x = v.x,
+                y = v.y,
+                z = v.z,
+            )
+        }
+        list.sortedBy { hypot(it.x - userVenuePos.x, it.z - userVenuePos.z) }
     }
 
     Box(modifier.fillMaxSize().background(Color.Black)) {
@@ -449,8 +703,17 @@ fun WayFinderCaptureScreen(
                 if (message != trackingMessage) trackingMessage = message
                 val now = frame.timestamp / 1_000_000
 
-                // Tracking lost for a while: the AR world may have been re-based. Keep what was recorded, then ask
-                // for a new scan of a sign before recording continues.
+                // Always keep camera coordinates updated even if tracking is still warming up
+                val camMatrix = FloatArray(16)
+                frame.camera.pose.toMatrix(camMatrix, 0)
+                camera[0] = camMatrix[12]; camera[1] = camMatrix[13]; camera[2] = camMatrix[14]
+
+                // Handle manual reference capture immediately on next frame without waiting for 20 steady frames!
+                if (captureReq[0]) {
+                    captureReq[0] = false
+                    captureReferencePoint(frame, session)
+                }
+
                 if (message != null) {
                     val since = lostSince ?: now.also { lostSince = it }
                     if (now - since > TRACKING_LOST_RESET_MS && filter.isAligned) {
@@ -469,24 +732,28 @@ fun WayFinderCaptureScreen(
 
                 val interval = if (lockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else LOCK_IN_INTERVAL_MS
                 for (sighting in markerTracker.sightings(frame, now, interval)) {
-                    // The walk is measured from one sign. Another sign sits in the venue at its surveyed position, which for
-                    // a sign hung wherever it was convenient is wrong, and blending it in would bend the whole path. So after
-                    // the first sign, only that same sign is used (to lock in and to correct drift when re-scanned).
                     val start = startMarker
-                    if (start != null && sighting.marker.id != start.id) {
+                    val isCapturedRef = sighting.marker.id.startsWith("ref-")
+                    val isBootstrap = start == null || start.id == "origin-bootstrap"
+                    if (!isBootstrap && sighting.marker.id != start!!.id && !isCapturedRef) {
                         if (now - otherSignToastMs[0] > 6_000) {
                             otherSignToastMs[0] = now
-                            showToast("This path is measured from “${start.name.resolved()}”. Scan that sign again, not another one.", 3_500)
+                            showToast("Matched “${sighting.marker.name.resolved()}”", 2_500)
                         }
-                        continue
                     }
-                    // The first sign aligns; later sightings are blended in by distance, head-on view and viewpoint variety.
                     val candidate = MarkerAlignment.alignment(sighting.markerInSession, MarkerAlignment.transform(sighting.marker))
-                    if (filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, sighting.cameraInSession)) alignment = filter.alignment
-                    if (startMarker == null) startMarker = sighting.marker
+                    if (isCapturedRef && !filter.isLockedIn) {
+                        repeat(AlignmentFilter.LOCK_IN_SIGHTINGS) {
+                            if (filter.update(candidate, 1f, 1f, null)) alignment = filter.alignment
+                        }
+                    } else if (filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, sighting.cameraInSession)) {
+                        alignment = filter.alignment
+                    }
+                    if (isBootstrap || isCapturedRef) {
+                        startMarker = sighting.marker
+                    }
+                    currentAtName = sighting.marker.name.resolved()
 
-                    // Keep every scan of a sign separately, with how far the walk had got: re-scanning a sign later shows
-                    // how much ARCore drifted since the first scan, and that drift is then removed from the path.
                     val visit = visits.lastOrNull()?.takeIf { now - it.lastMs < VISIT_GAP_MS }
                         ?: Visit(recorder.progress, now).also { visits += it }
                     val closeBefore = visit.filter.closeSightings
@@ -505,12 +772,8 @@ fun WayFinderCaptureScreen(
                 lockProgress = filter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)
                 lockedIn = filter.isLockedIn
 
-                // Find the real floor from the very first frame (before any sign is locked): planes when ARCore has
-                // them, otherwise a depth ray straight down. The middle of the recent samples is used.
-                if (message == null && frameCounter[0]++ % 2 == 0) {
-                    val m = FloatArray(16)
-                    frame.camera.pose.toMatrix(m, 0)
-                    val here = Vec3(m[12], m[13], m[14])
+                if (message == null && frameCounter[0] % 2 == 0) {
+                    val here = Vec3(camera[0], camera[1], camera[2])
                     (markerTracker.floorHeightBelow(session, here) ?: markerTracker.floorHeightByRay(frame, here))
                         ?.let { floorSamples.addLast(it) }
                     while (floorSamples.size > 7) floorSamples.removeFirst()
@@ -519,17 +782,23 @@ fun WayFinderCaptureScreen(
                 }
 
                 val marker = startMarker
-                if (marker != null && lockedIn && message == null) {
-                    val matrix = FloatArray(16)
-                    frame.camera.pose.toMatrix(matrix, 0)
-                    camera[0] = matrix[12]; camera[1] = matrix[13]; camera[2] = matrix[14]
+                if (marker != null && (lockedIn || bootstrapped) && message == null) {
                     val cameraSession = Vec3(camera[0], camera[1], camera[2])
                     val inVenue = filter.alignment.inverse().transformPoint(cameraSession)
                     val level = venue.level(forDeviceHeight = inVenue.y)?.id ?: marker.level
                     user.valid = true
                     user.session = cameraSession
-                    user.forward = -Mat4(matrix).column(2)
+                    user.forward = -Mat4(camMatrix).column(2)
                     user.level = level; user.venueX = inVenue.x; user.venueZ = inVenue.z
+                    if (frameCounter[0] % 15 == 0) {
+                        userVenuePos = inVenue
+                        // Update nearest reference point if within 2.5m
+                        allRefPins.minByOrNull { hypot(it.x - inVenue.x, it.z - inVenue.z) }?.let { nearest ->
+                            if (hypot(nearest.x - inVenue.x, nearest.z - inVenue.z) <= 2.5f) {
+                                currentAtName = nearest.name
+                            }
+                        }
+                    }
                     venue.level(level)?.name?.resolved()?.let { if (it != levelName) levelName = it }
 
                     recorder.record(cameraSession)
@@ -541,142 +810,346 @@ fun WayFinderCaptureScreen(
                     if (isSteady != steady) steady = isSteady
                     refreshFromAnchors()
                     val length = committedLength() + recorder.lengthMeters
-                    canSave = length >= MIN_PATH_LENGTH_M
-                    recordedSummary = "Recording · ${committedPath.size + recorder.points.size} points · %.0f m".format(length)
+                    canSave = length >= MIN_PATH_LENGTH_M || recorder.points.isNotEmpty()
+                    recordedSummary = "Recording · ${committedPath.size + recorder.points.size} pts · %.1f m".format(length)
 
                     if (pendingTap[2] == 1f) {
                         pendingTap[2] = 0f
                         handleTap(frame, session, pendingTap[0], pendingTap[1])
                     }
-                    if (captureReq[0]) {
-                        captureReq[0] = false
-                        captureReferencePoint(frame, session)
-                    }
+                    maybeAutoCapture(frame, session)
                 } else {
-                    if (pendingTap[2] == 1f) showToast("Tracking is limited right now. Hold still for a moment, then tap again.", 2_500)
-                    pendingTap[2] = 0f
-                    recent.clear()
-                    if (steady) steady = false
+                    if (pendingTap[2] == 1f) {
+                        pendingTap[2] = 0f
+                        handleTap(frame, session, pendingTap[0], pendingTap[1])
+                    }
                 }
+                frameCounter[0]++
             },
             onSessionFailed = { error -> showToast("AR isn't available: ${error.message}", 8_000) },
         ) {
             val cameraPosition = { Position(camera[0], camera[1], camera[2]) }
-            // Already-converted objects live in the venue frame; newer ones in the session frame (identity root).
-            ObjectsScene(committedObjects.toList(), alignment, cameraPosition)
+            // Render live 3D route if the admin picked a target from the dropdown
+            val routeDest = activeRouteDestPoi
+            if (activeRoute != null && routeDest != null) {
+                RouteScene(
+                    route = activeRoute,
+                    level = user.level.ifEmpty { defaultLevel },
+                    venue = venue,
+                    destination = routeDest,
+                    alignment = alignment,
+                    cameraPosition = cameraPosition,
+                )
+            }
+            // Render all saved objects + committed objects in venue frame, and session objects in session frame
+            ObjectsScene(allVenueObjects, alignment, cameraPosition)
             ObjectsScene(sessionObjects.toList(), Mat4.IDENTITY, cameraPosition)
+            // Render all reference points (saved + captured this session) with BLUE pins and BLUE text labels
+            ReferencePointsScene(allRefPins, alignment, cameraPosition)
         }
 
         // Taps on the camera view place the selected object; the controls below sit on top and take their own taps.
-        if (lockedIn) {
-            Box(
-                Modifier.fillMaxSize().pointerInput(Unit) {
-                    detectTapGestures { offset ->
-                        pendingTap[0] = offset.x; pendingTap[1] = offset.y; pendingTap[2] = 1f
+        Box(
+            Modifier.fillMaxSize().pointerInput(Unit) {
+                detectTapGestures { offset ->
+                    pendingTap[0] = offset.x; pendingTap[1] = offset.y; pendingTap[2] = 1f
+                }
+            },
+        )
+
+        // Top HUD: "You are currently at" + Navigation Dropdown + Auto points switch + status banner
+        Column(
+            Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            // Top bar: Currently At + Dropdown + Auto Points
+            Column(
+                Modifier.fillMaxWidth()
+                    .background(Color(0xCC1C1C1E), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("You are currently at", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                        Text(
+                            "📍 $currentAtName",
+                            color = Color(0xFF0A84FF),
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
                     }
-                },
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("Auto points", color = Color.White, fontSize = 12.sp)
+                        Switch(checked = autoPoints, onCheckedChange = { autoPoints = it })
+                    }
+                }
+
+                // Dropdown selector for available navigations (destinations, reference points, placed objects)
+                Box(Modifier.fillMaxWidth()) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .background(Color(0xFF2C2C2E), RoundedCornerShape(10.dp))
+                            .clickable { navDropdownExpanded = true }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        val currentSelection = selectedNavTarget
+                        Text(
+                            if (currentSelection != null) {
+                                val d = hypot(currentSelection.x - userVenuePos.x, currentSelection.z - userVenuePos.z)
+                                "Navigate: ${currentSelection.glyph} ${currentSelection.label} (%.1f m)".format(d)
+                            } else {
+                                "Navigate to (${navTargets.size} available)…"
+                            },
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (selectedNavTarget != null) {
+                                Text(
+                                    "✕",
+                                    color = Color.White.copy(alpha = 0.75f),
+                                    fontSize = 14.sp,
+                                    modifier = Modifier.clickable { planToTarget(null) }.padding(horizontal = 4.dp),
+                                )
+                            }
+                            Text("▾", color = Color(0xFF0A84FF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = navDropdownExpanded,
+                        onDismissRequest = { navDropdownExpanded = false },
+                        modifier = Modifier.fillMaxWidth(0.9f).heightIn(max = 320.dp),
+                    ) {
+                        if (navTargets.isEmpty()) {
+                            DropdownMenuItem(
+                                text = { Text("No destinations, reference points, or objects yet") },
+                                onClick = { navDropdownExpanded = false },
+                            )
+                        } else {
+                            if (selectedNavTarget != null) {
+                                DropdownMenuItem(
+                                    text = { Text("✕ Clear active route", color = Color(0xFFFF3B30), fontWeight = FontWeight.SemiBold) },
+                                    onClick = {
+                                        navDropdownExpanded = false
+                                        planToTarget(null)
+                                    },
+                                )
+                            }
+                            navTargets.forEach { target ->
+                                val dist = hypot(target.x - userVenuePos.x, target.z - userVenuePos.z)
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(
+                                            Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Column(Modifier.weight(1f)) {
+                                                Text(
+                                                    "${target.glyph} ${target.label}",
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = if (target.glyph == "📍") Color(0xFF0A84FF) else Color.Unspecified,
+                                                )
+                                                Text(target.subtitle, fontSize = 12.sp, color = Color.Gray)
+                                            }
+                                            Text("%.1f m".format(dist), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                        }
+                                    },
+                                    onClick = {
+                                        navDropdownExpanded = false
+                                        planToTarget(target)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Compact recording status banner
+            val objectCount = allVenueObjects.count { !it.isReference } + sessionObjects.count { !it.isReference }
+            GuidanceBannerView(
+                GuidanceBanner(
+                    instruction = trackingMessage ?: "Tap screen to place ${selectedKind.glyph} ${selectedKind.label} · ◎ to add ref point",
+                    glyph = selectedKind.glyph,
+                    detail = listOfNotNull(
+                        levelName.ifEmpty { null },
+                        recordedSummary.ifEmpty { "Ready to record" },
+                        signAgreement.ifEmpty { null },
+                        "${allRefPins.size} ref pt${if (allRefPins.size == 1) "" else "s"}",
+                        "$objectCount obj${if (objectCount == 1) "" else "s"}",
+                        if (floorFound) "floor ✓" else "finding floor…",
+                    ).joinToString(" · "),
+                ),
             )
         }
 
-        Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
-            when {
-                startMarker == null -> AlignmentPromptView(
-                    trackingMessage ?: "Look for a sign like these near entrances, elevators and escalators. " +
-                        "Face it from 1–2.5 m and move the phone slowly side to side; scanning it starts recording your walk.",
-                    signs,
-                )
-                !lockedIn -> GuidanceBannerView(
-                    GuidanceBanner(
-                        instruction = "Locking onto the sign…",
-                        glyph = "◎",
-                        detail = trackingMessage
-                            ?: "Face the sign, 1–2.5 m away, and move the phone slowly side to side ($lockProgress/${AlignmentFilter.LOCK_IN_SIGHTINGS})",
-                    ),
-                )
-                else -> {
-                    val objectCount = committedObjects.count { !it.isReference } + sessionObjects.count { !it.isReference }
-                    GuidanceBannerView(
-                        GuidanceBanner(
-                            instruction = if (canSave) "Walk to the destination, then save it" else "Walk to where the destination is",
-                            glyph = "●",
-                            detail = trackingMessage ?: listOfNotNull(
-                                levelName.ifEmpty { null }, recordedSummary.ifEmpty { null }, signAgreement.ifEmpty { null },
-                                if (objectCount > 0) "$objectCount object${if (objectCount == 1) "" else "s"}" else null,
-                                if (floorFound) "floor ✓" else "finding floor…",
-                            ).joinToString(" · "),
-                        ),
-                    )
-                }
+        greenFlash?.let { msg ->
+            Box(
+                Modifier.align(Alignment.Center)
+                    .background(Color(0xFF0A84FF), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                Text("✓  $msg", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
 
-        Row(
-            Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            CircleButton("✕", "Cancel", onClick = onCancel)
-            if (lockedIn) {
-                CircleButton("◎", "Add reference point", onClick = {
-                    captureReq[0] = true
-                    showToast("Hold still — capturing reference point…", 1_500)
-                })
-            }
-        }
+        // Bottom panel: ALWAYS shows all Admin controls so nothing is ever hidden.
         Column(
-            Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth().safeDrawingPadding().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             ToastHost(toast)
-            if (lockedIn) {
-                namingObjectId?.let { id ->
-                    val isMessage = sessionObjects.firstOrNull { it.id == id }?.kind == PlacedObjectKind.MESSAGE
-                    NameBox(
-                        value = nameDraft,
-                        hint = if (isMessage) "Your message" else "Name this object (optional)",
-                        onChange = { text ->
-                            nameDraft = text.take(30)
-                            val index = sessionObjects.indexOfFirst { it.id == id }
-                            if (index >= 0) sessionObjects[index] = sessionObjects[index].copy(text = nameDraft.trim())
-                        },
-                        onDone = { namingObjectId = null },
-                    )
-                }
-                ObjectBar(selected = selectedKind, onSelect = { selectedKind = it })
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (hasUserObjects) {
-                        TextButton(onClick = {
-                            // Removes the last object the user placed; the automatic reference point stays.
-                            val inSession = sessionObjects.indexOfLast { !it.isReference }
-                            if (inSession >= 0) {
-                                val removed = sessionObjects.removeAt(inSession)
-                                anchors.remove(removed.id)?.detach()
-                                if (namingObjectId == removed.id) namingObjectId = null
-                            } else {
-                                val committed = committedObjects.indexOfLast { !it.isReference }
-                                if (committed >= 0) committedObjects.removeAt(committed)
-                            }
-                        }) { Text("Undo", color = Color.White) }
-                    }
-                    Button(
-                        enabled = canSave && steady && trackingMessage == null,
-                        onClick = {
-                            // The destination is where the phone has been held, averaged over the last moment, so
-                            // hand sway can't move it. It is fixed now, before the name is typed.
-                            pendingDestination = averageOf(recent) ?: user.session
-                            pendingLevel = user.level
-                            pendingFloorSession = floorSessionY()
-                            if (recorder.progress >= 8f && visits.count { it.filter.closeSightings >= 2 } < 2) {
-                                showToast("Tip: scan a sign again at the end next time, to correct drift.", 3_500)
-                            }
-                            naming = true
-                        },
-                    ) {
-                        Text(if (canSave && !steady) "Hold steady…" else "Save destination here")
-                    }
+            namingObjectId?.let { id ->
+                val isMessage = sessionObjects.firstOrNull { it.id == id }?.kind == PlacedObjectKind.MESSAGE
+                NameBox(
+                    value = nameDraft,
+                    hint = if (isMessage) "Your message" else "Name this object (optional)",
+                    onChange = { text ->
+                        nameDraft = text.take(30)
+                        val index = sessionObjects.indexOfFirst { it.id == id }
+                        if (index >= 0) sessionObjects[index] = sessionObjects[index].copy(text = nameDraft.trim())
+                    },
+                    onDone = { namingObjectId = null },
+                )
+            }
+            ObjectBar(selected = selectedKind, onSelect = { selectedKind = it })
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircleButton("✕", "Exit camera", onClick = onCancel)
+                CircleButton("⊕", "Start here", onClick = { startWithoutSign() })
+                CircleButton("◎", "Add reference point", onClick = {
+                    captureReq[0] = true
+                    showToast("Capturing reference point…", 1_200)
+                })
+                CircleButton("☰", "Points", onClick = { showPointsList = true })
+                CircleButton("◳", "Objects", onClick = { showObjectsList = true })
+                Spacer(Modifier.weight(1f))
+                if (hasUserObjects) {
+                    TextButton(onClick = {
+                        val inSession = sessionObjects.indexOfLast { !it.isReference }
+                        if (inSession >= 0) {
+                            val removed = sessionObjects.removeAt(inSession)
+                            anchors.remove(removed.id)?.detach()
+                            if (namingObjectId == removed.id) namingObjectId = null
+                        } else {
+                            val committed = committedObjects.indexOfLast { !it.isReference }
+                            if (committed >= 0) committedObjects.removeAt(committed)
+                        }
+                    }) { Text("Undo", color = Color.White) }
                 }
             }
+            Button(
+                enabled = true,
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    pendingDestination = averageOf(recent) ?: Vec3(camera[0], camera[1], camera[2])
+                    pendingLevel = user.level.ifEmpty { defaultLevel }
+                    pendingFloorSession = floorSessionY()
+                    naming = true
+                },
+            ) {
+                Text("Save destination here")
+            }
         }
+    }
+
+    if (showPointsList) {
+        AlertDialog(
+            onDismissRequest = { showPointsList = false },
+            title = { Text("Reference points (${allRefPins.size})") },
+            text = {
+                if (allRefPins.isEmpty()) {
+                    Text("None yet. Tap ◎ to capture one.")
+                } else {
+                    Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        allRefPins.forEach { p ->
+                            val dist = hypot(p.x - userVenuePos.x, p.z - userVenuePos.z)
+                            Text(
+                                "📍 ${p.name} (%.1f m)".format(dist),
+                                color = Color(0xFF0A84FF),
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.fillMaxWidth()
+                                    .clickable {
+                                        showPointsList = false
+                                        planToTarget(
+                                            AdminNavTarget(
+                                                id = "refpin-${p.name}",
+                                                label = p.name,
+                                                glyph = "📍",
+                                                subtitle = "Reference point",
+                                                level = defaultLevel,
+                                                x = p.x,
+                                                y = p.y,
+                                                z = p.z,
+                                            ),
+                                        )
+                                    }
+                                    .padding(vertical = 12.dp),
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showPointsList = false }) { Text("Close") } },
+        )
+    }
+
+    if (showObjectsList) {
+        val items = sessionObjects.filter { !it.isReference }.map { it to false } +
+            allVenueObjects.filter { !it.isReference }.map { it to true }
+        AlertDialog(
+            onDismissRequest = { showObjectsList = false },
+            title = { Text("Objects (${items.size})") },
+            text = {
+                if (items.isEmpty()) {
+                    Text("None yet. Pick an object on the bar, then tap the camera view to place it.")
+                } else {
+                    Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        items.forEach { (obj, inVenue) ->
+                            val label = if (obj.text.isNotBlank()) obj.text else obj.kind.label
+                            Text(
+                                "${obj.kind.glyph} $label",
+                                modifier = Modifier.fillMaxWidth()
+                                    .clickable {
+                                        showObjectsList = false
+                                        val vPos = if (inVenue) obj.position else filter.alignment.inverse().transformPoint(obj.position)
+                                        planToTarget(
+                                            AdminNavTarget(
+                                                id = obj.id,
+                                                label = label,
+                                                glyph = obj.kind.glyph,
+                                                subtitle = "Placed ${obj.kind.label}",
+                                                level = obj.level.ifEmpty { defaultLevel },
+                                                x = vPos.x,
+                                                y = vPos.y,
+                                                z = vPos.z,
+                                            ),
+                                        )
+                                    }
+                                    .padding(vertical = 12.dp),
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showObjectsList = false }) { Text("Close") } },
+        )
     }
 
     if (naming) {
@@ -695,26 +1168,40 @@ fun WayFinderCaptureScreen(
                     enabled = name.isNotBlank() && pendingDestination != null,
                     onClick = {
                         naming = false
-                        // The destination is set automatically: where the user stood, held steady. End the path exactly
-                        // there, then convert everything recorded in the session frame with the final alignment.
                         val spot = pendingDestination!!
                         recorder.recordAnchor(spot)
                         refreshFromAnchors()
                         val track = buildTrack()
-                        // The destination and its floor use the alignment for the end of the walk (the last scan).
                         val venueFromSession = track.venueFromSessionAt(recorder.progress)
                         val here = venueFromSession.transformPoint(spot)
                         val floorY = venueFromSession.transformPoint(Vec3(spot.x, pendingFloorSession, spot.z)).y
                         val spreadCm = visits.firstOrNull()?.filter?.spreadCm
                         val drift = driftCm[0].takeIf { it > 0f }
                         val startId = startMarker?.id.orEmpty()
+                        val savedLevel = pendingLevel.ifEmpty { defaultLevel }
                         commit()
+                        val trimmed = name.trim()
                         onSave(
                             CapturedDestination(
-                                name.trim(), pendingLevel, here.x, here.z, committedPath.toList(), committedObjects.toList(),
+                                trimmed, savedLevel, here.x, here.z, committedPath.toList(), committedObjects.toList(),
                                 floorY = floorY, startMarkerId = startId, alignmentSpreadCm = spreadCm, driftCorrectedCm = drift,
                             ),
                         )
+                        // Keep the admin in the live camera view! Add the newly saved destination to the dropdown & currentAt
+                        sessionSavedDestinations.add(
+                            Venue.POI(
+                                id = "custom-session-${sessionSavedDestinations.size}",
+                                name = LocalizedText(trimmed),
+                                category = CustomDestination.CATEGORY,
+                                level = savedLevel,
+                                x = here.x,
+                                z = here.z,
+                                node = "",
+                                elevation = floorY,
+                            ),
+                        )
+                        currentAtName = trimmed
+                        greenFlash = "Destination “$trimmed” saved"
                     },
                 ) { Text("Save") }
             },
@@ -725,9 +1212,9 @@ fun WayFinderCaptureScreen(
     pendingRef?.let { ref ->
         var refName by remember(ref) { mutableStateOf("") }
         val quality = when {
-            !ref.accepted -> "Too plain to track — aim at a more detailed, flat spot."
+            !ref.accepted -> "Low contrast — will still save as reference pin"
             ref.detail >= 55 -> "Good detail — trackable"
-            else -> "Low detail — may be unreliable"
+            else -> "Low detail — may need close-up view"
         }
         AlertDialog(
             onDismissRequest = { pendingRef = null },
@@ -750,16 +1237,19 @@ fun WayFinderCaptureScreen(
             },
             confirmButton = {
                 TextButton(
-                    enabled = refName.isNotBlank() && ref.accepted,
+                    enabled = refName.isNotBlank(),
                     onClick = {
+                        val trimmed = refName.trim()
                         onSaveReferencePoint(
                             CapturedReferencePoint(
-                                name = refName.trim(), image = ref.image, physicalWidth = ref.physicalWidth,
+                                name = trimmed, image = ref.image, physicalWidth = ref.physicalWidth,
                                 level = ref.level, x = ref.x, y = ref.y, z = ref.z, facing = ref.facing,
                                 mounting = Venue.MarkerMounting.WALL,
                             ),
                         )
-                        showToast("Reference point “${refName.trim()}” saved", 2_500)
+                        sessionRefPins.add(RefPin(ref.x, ref.y, ref.z, trimmed))
+                        currentAtName = trimmed
+                        greenFlash = "Reference point “$trimmed” saved"
                         pendingRef = null
                     },
                 ) { Text("Save") }
