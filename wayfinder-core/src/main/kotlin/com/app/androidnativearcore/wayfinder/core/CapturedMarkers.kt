@@ -63,4 +63,10 @@ class CapturedMarkerStore(private val directory: File) {
         File(directory, "$id.json").delete()
         imageFile(id).delete()
     }
+
+    /** Removes every captured reference point (all metadata and images). */
+    fun clear() {
+        directory.listFiles { f -> f.isFile && (f.name.endsWith(".json") || f.name.endsWith(".png")) }
+            .orEmpty().forEach { it.delete() }
+    }
 }

@@ -167,6 +167,10 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     paths = store.load(basePackage.venue.id)
                     extraMarkers = markerStore.load(basePackage.venue.id)
                 },
+                onClearMarkers = {
+                    markerStore.clear()
+                    extraMarkers = markerStore.load(basePackage.venue.id)
+                },
             )
         }
         Screen.Capture -> WayFinderCaptureScreen(
@@ -218,7 +222,14 @@ private fun WayFinderHost(basePackage: VenuePackage) {
         )
         Screen.Signs -> {
             BackHandler { screen = Screen.List }
-            MarkerGalleryScreen(pkg, onBack = { screen = Screen.List })
+            MarkerGalleryScreen(
+                pkg = pkg,
+                onBack = { screen = Screen.List },
+                onDeleteMarker = if (mode == AppMode.ADMIN) ({ id ->
+                    markerStore.delete(id)
+                    extraMarkers = markerStore.load(basePackage.venue.id)
+                }) else null,
+            )
         }
         is Screen.Navigate -> {
             val listener = remember {
@@ -266,14 +277,17 @@ private fun DestinationListScreen(
     onDeleteDestination: (Venue.POI) -> Unit,
     onRenameDestination: (Venue.POI, String) -> Unit = { _, _ -> },
     onDataChanged: () -> Unit = {},
+    onClearMarkers: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val venue = pkg.venue
     val admin = mode == AppMode.ADMIN
+    val capturedCount = venue.markers.count { it.id.startsWith("ref-") }
     var search by remember { mutableStateOf("") }
     var unsupported by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Venue.POI?>(null) }
     var deleting by remember { mutableStateOf<Venue.POI?>(null) }
+    var clearing by remember { mutableStateOf(false) }
     var transferMsg by remember { mutableStateOf<String?>(null) }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -341,6 +355,13 @@ private fun DestinationListScreen(
                         IosRow(title = "Save data", glyph = "⬆", subtitle = "Export points & paths as a file", onClick = { exportData() })
                         IosRowDivider()
                         IosRow(title = "Load data", glyph = "⬇", subtitle = "Import a saved bundle", onClick = { importLauncher.launch(arrayOf("application/zip", "*/*")) })
+                        IosRowDivider()
+                        IosRow(
+                            title = "Clear reference points",
+                            glyph = "🗑",
+                            subtitle = if (capturedCount > 0) "$capturedCount captured · removes all" else "none captured",
+                            onClick = { if (capturedCount > 0) clearing = true },
+                        )
                     }
                 }
             }
@@ -457,6 +478,16 @@ private fun DestinationListScreen(
             confirmButton = { TextButton(onClick = { transferMsg = null }) { Text("OK") } },
         )
     }
+
+    if (clearing) {
+        AlertDialog(
+            onDismissRequest = { clearing = false },
+            title = { Text("Clear all reference points?") },
+            text = { Text("Removes all $capturedCount captured reference images from this phone. Recorded paths are kept.") },
+            confirmButton = { TextButton(onClick = { onClearMarkers(); clearing = false }) { Text("Clear all") } },
+            dismissButton = { TextButton(onClick = { clearing = false }) { Text("Cancel") } },
+        )
+    }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -488,7 +519,7 @@ private fun POIRow(poi: Venue.POI, onClick: () -> Unit, onLongClick: (() -> Unit
 
 /** Shows the venue's AR signs with where they belong, and lets testers share an image to print. */
 @Composable
-private fun MarkerGalleryScreen(pkg: VenuePackage, onBack: () -> Unit) {
+private fun MarkerGalleryScreen(pkg: VenuePackage, onBack: () -> Unit, onDeleteMarker: ((String) -> Unit)? = null) {
     val context = LocalContext.current
     Scaffold { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding).statusBarsPadding()) {
@@ -511,15 +542,20 @@ private fun MarkerGalleryScreen(pkg: VenuePackage, onBack: () -> Unit) {
                     }
                     Text(marker.name.resolved(), style = MaterialTheme.typography.titleMedium)
                     Text(placement(pkg, marker), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    TextButton(onClick = {
-                        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", pkg.file(marker))
-                        val send = Intent(Intent.ACTION_SEND).apply {
-                            type = "image/png"
-                            putExtra(Intent.EXTRA_STREAM, uri)
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = {
+                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", pkg.file(marker))
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "image/png"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(send, marker.name.resolved()))
+                        }) { Text("Share image") }
+                        if (onDeleteMarker != null && marker.id.startsWith("ref-")) {
+                            TextButton(onClick = { onDeleteMarker(marker.id) }) { Text("Delete") }
                         }
-                        context.startActivity(Intent.createChooser(send, marker.name.resolved()))
-                    }) { Text("Share image") }
+                    }
                 }
             }
         }
