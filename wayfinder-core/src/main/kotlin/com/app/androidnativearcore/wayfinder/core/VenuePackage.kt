@@ -20,7 +20,10 @@ class VenuePackage(
 ) {
     class LoadError(message: String) : Exception(message)
 
-    fun file(forMarker: Venue.Marker): File = File(baseDir, forMarker.image)
+    fun file(forMarker: Venue.Marker): File =
+        // Bundled markers use a path relative to the package folder; reference points captured on-device store an
+        // absolute path to their own saved image, which survives the package being re-copied from assets.
+        File(forMarker.image).let { if (it.isAbsolute) it else File(baseDir, forMarker.image) }
 
     /** The same package files with different venue data, e.g. with the user's own destinations added. */
     fun withVenue(venue: Venue) = VenuePackage(venue, baseDir)

@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.app.androidnativearcore.wayfinder.core.AlignmentFilter
 import com.app.androidnativearcore.wayfinder.core.CustomDestination
+import com.app.androidnativearcore.wayfinder.core.followsWalkedPaths
 import com.app.androidnativearcore.wayfinder.core.MarkerAlignment
 import com.app.androidnativearcore.wayfinder.core.Mat4
 import com.app.androidnativearcore.wayfinder.core.NavigationProgress
@@ -277,14 +278,14 @@ class NavigationController(
     private fun planRoute(position: Vec3, level: String, rerouted: Boolean) {
         needsRoute = false
         try {
-            val route = if (destination.category == CustomDestination.CATEGORY) {
+            val route = if (destination.followsWalkedPaths) {
                 planWalkedRoute(position, level)
             } else {
                 planner.route(position, level, toPOI = destination.id, profile = profile)
             }
             tracker = NavigationTracker(route).also {
                 // A destination the user saved is where they stood, measured to centimeters; 2 m is several steps early.
-                it.arrivalRadius = if (destination.category == CustomDestination.CATEGORY) CUSTOM_ARRIVAL_RADIUS_M else 2f
+                it.arrivalRadius = if (destination.followsWalkedPaths) CUSTOM_ARRIVAL_RADIUS_M else 2f
             }
             arrivedSince = null
             uiState = uiState.copy(route = route, renderedLevel = level, banner = uiState.banner ?: placeholderBanner())

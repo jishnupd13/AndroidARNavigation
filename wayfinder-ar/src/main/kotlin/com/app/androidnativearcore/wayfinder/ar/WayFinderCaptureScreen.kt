@@ -1,7 +1,10 @@
 package com.app.androidnativearcore.wayfinder.ar
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.view.Surface
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -10,8 +13,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
@@ -30,12 +35,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.google.ar.core.AugmentedImageDatabase
+import kotlin.math.atan2
+import kotlin.math.min
 import com.app.androidnativearcore.wayfinder.core.AlignmentFilter
 import com.app.androidnativearcore.wayfinder.core.AlignmentTrack
 import com.app.androidnativearcore.wayfinder.core.MarkerAlignment
@@ -81,6 +92,48 @@ data class CapturedDestination(
     /** How much drift (cm) re-scanning a sign during the walk corrected; null if no sign was re-scanned. */
     val driftCorrectedCm: Float? = null,
 )
+
+/**
+ * A reference point the admin captured: a photo of a distinctive spot plus where it is, so it can be registered as
+ * an AR marker and later re-recognized to re-align the session. The caller saves the [image] and builds a
+ * [com.app.androidnativearcore.wayfinder.core.Venue.Marker] from the rest.
+ */
+data class CapturedReferencePoint(
+    val name: String,
+    val image: Bitmap,
+    /** Real-world width of [image], in meters (estimated from distance and camera focal length). */
+    val physicalWidth: Float,
+    val level: String,
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val facing: Float,
+    val mounting: Venue.MarkerMounting,
+)
+
+/** What the capture produced, held while the admin names/confirms it. */
+private class RefCapture(
+    val image: Bitmap,
+    val physicalWidth: Float,
+    val level: String,
+    val x: Float,
+    val y: Float,
+    val z: Float,
+    val facing: Float,
+    /** Detail proxy 0–100. */
+    val detail: Int,
+    /** Whether ARCore accepted the image into an augmented-image database (will it track?). */
+    val accepted: Boolean,
+    val distanceM: Float,
+)
+
+/** Degrees to rotate the sensor-landscape camera image so it is upright for the current display orientation. */
+private fun displayRotationDegrees(view: android.view.View): Int = when (view.display?.rotation) {
+    Surface.ROTATION_90 -> 0
+    Surface.ROTATION_180 -> 270
+    Surface.ROTATION_270 -> 180
+    else -> 90
+}
 
 /** Shortest recorded walk (meters) that is worth saving as a route. */
 private const val MIN_PATH_LENGTH_M = 1f
@@ -151,6 +204,8 @@ fun WayFinderCaptureScreen(
     onSave: (CapturedDestination) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Called when the admin captures and confirms a reference point; the caller persists it. */
+    onSaveReferencePoint: (CapturedReferencePoint) -> Unit = {},
 ) {
     val venue = pkg.venue
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
@@ -193,6 +248,7 @@ fun WayFinderCaptureScreen(
     var recordedSummary by remember { mutableStateOf("") }
     var canSave by remember { mutableStateOf(false) }
     var steady by remember { mutableStateOf(false) }
+    var floorFound by remember { mutableStateOf(false) } // ARCore has measured the real floor
     var pendingDestination by remember { mutableStateOf<Vec3?>(null) } // session position chosen when Save was tapped
     var pendingLevel by remember { mutableStateOf("") }
     var pendingFloorSession by remember { mutableStateOf(0f) }
@@ -203,6 +259,8 @@ fun WayFinderCaptureScreen(
     // The object just placed, whose name the user can type in the box at the bottom (the name floats above it).
     var namingObjectId by remember { mutableStateOf<String?>(null) }
     var nameDraft by remember { mutableStateOf("") }
+    var pendingRef by remember { mutableStateOf<RefCapture?>(null) } // a captured reference point awaiting naming
+    val captureReq = remember { BooleanArray(1) }                    // set when the Add-reference-point button is tapped
 
     val view = LocalView.current
     DisposableEffect(view) {
@@ -330,6 +388,52 @@ fun WayFinderCaptureScreen(
         )
     }
 
+    /**
+     * Grabs the current camera image of whatever the center of the screen is aimed at, estimates its real-world size
+     * (from depth distance and focal length) and its venue position, scores how trackable it looks, and offers it for
+     * saving as a reference point. Aim at a distinctive flat spot, ideally above head height.
+     */
+    fun captureReferencePoint(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
+        val cameraPosition = Vec3(camera[0], camera[1], camera[2])
+        val hit = markerTracker.surfaceAt(frame, session, view.width / 2f, view.height / 2f, MAX_OBJECT_DISTANCE_M)
+        if (hit == null) {
+            showToast("Aim the center at a wall/feature within ${MAX_OBJECT_DISTANCE_M.toInt()} m, then capture.", 3_000)
+            return
+        }
+        val bitmap = try {
+            frame.acquireCameraImage().use { image ->
+                val full = CameraImage.toBitmap(image) ?: return showToast("Couldn't read the camera image. Try again.")
+                CameraImage.rotate(CameraImage.centerSquare(full, 0.6f), displayRotationDegrees(view))
+            }
+        } catch (e: Exception) {
+            showToast("Hold still for a moment, then capture again.")
+            return
+        }
+        val intrinsics = frame.camera.imageIntrinsics
+        val fx = intrinsics.focalLength[0]
+        val dims = intrinsics.imageDimensions
+        val cropSidePx = min(dims[0], dims[1]) * 0.6f
+        val distance = hit.position.distanceTo(cameraPosition)
+        val physicalWidth = (distance * cropSidePx / fx).coerceIn(0.05f, 3f)
+
+        val accepted = try {
+            AugmentedImageDatabase(session).addImage("probe", bitmap, physicalWidth)
+            true
+        } catch (e: Exception) {
+            false
+        }
+        val detail = CameraImage.detailScore(bitmap)
+
+        val venueFromSession = filter.alignment.inverse()
+        val surfaceVenue = venueFromSession.transformPoint(hit.position)
+        val cameraVenue = venueFromSession.transformPoint(cameraPosition)
+        val facing = (Math.toDegrees(
+            atan2((cameraVenue.x - surfaceVenue.x).toDouble(), (cameraVenue.z - surfaceVenue.z).toDouble()),
+        ).toFloat() + 360f) % 360f
+        val level = user.level.ifEmpty { startMarker?.level ?: "" }
+        pendingRef = RefCapture(bitmap, physicalWidth, level, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z, facing, detail, accepted, distance)
+    }
+
     Box(modifier.fillMaxSize().background(Color.Black)) {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
@@ -401,6 +505,19 @@ fun WayFinderCaptureScreen(
                 lockProgress = filter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)
                 lockedIn = filter.isLockedIn
 
+                // Find the real floor from the very first frame (before any sign is locked): planes when ARCore has
+                // them, otherwise a depth ray straight down. The middle of the recent samples is used.
+                if (message == null && frameCounter[0]++ % 2 == 0) {
+                    val m = FloatArray(16)
+                    frame.camera.pose.toMatrix(m, 0)
+                    val here = Vec3(m[12], m[13], m[14])
+                    (markerTracker.floorHeightBelow(session, here) ?: markerTracker.floorHeightByRay(frame, here))
+                        ?.let { floorSamples.addLast(it) }
+                    while (floorSamples.size > 7) floorSamples.removeFirst()
+                    val found = floorSamples.size >= 2
+                    if (found != floorFound) floorFound = found
+                }
+
                 val marker = startMarker
                 if (marker != null && lockedIn && message == null) {
                     val matrix = FloatArray(16)
@@ -415,11 +532,6 @@ fun WayFinderCaptureScreen(
                     user.level = level; user.venueX = inVenue.x; user.venueZ = inVenue.z
                     venue.level(level)?.name?.resolved()?.let { if (it != levelName) levelName = it }
 
-                    // Sample the real floor a few times a second; the middle of the recent samples is used.
-                    if (frameCounter[0]++ % 8 == 0) {
-                        markerTracker.floorHeightBelow(session, cameraSession)?.let { floorSamples.addLast(it) }
-                        while (floorSamples.size > 15) floorSamples.removeFirst()
-                    }
                     recorder.record(cameraSession)
                     recent.addLast(cameraSession)
                     while (recent.size > STEADY_FRAMES) recent.removeFirst()
@@ -435,6 +547,10 @@ fun WayFinderCaptureScreen(
                     if (pendingTap[2] == 1f) {
                         pendingTap[2] = 0f
                         handleTap(frame, session, pendingTap[0], pendingTap[1])
+                    }
+                    if (captureReq[0]) {
+                        captureReq[0] = false
+                        captureReferencePoint(frame, session)
                     }
                 } else {
                     if (pendingTap[2] == 1f) showToast("Tracking is limited right now. Hold still for a moment, then tap again.", 2_500)
@@ -486,6 +602,7 @@ fun WayFinderCaptureScreen(
                             detail = trackingMessage ?: listOfNotNull(
                                 levelName.ifEmpty { null }, recordedSummary.ifEmpty { null }, signAgreement.ifEmpty { null },
                                 if (objectCount > 0) "$objectCount object${if (objectCount == 1) "" else "s"}" else null,
+                                if (floorFound) "floor ✓" else "finding floor…",
                             ).joinToString(" · "),
                         ),
                     )
@@ -493,8 +610,17 @@ fun WayFinderCaptureScreen(
             }
         }
 
-        Row(Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(16.dp)) {
+        Row(
+            Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
             CircleButton("✕", "Cancel", onClick = onCancel)
+            if (lockedIn) {
+                CircleButton("◎", "Add reference point", onClick = {
+                    captureReq[0] = true
+                    showToast("Hold still — capturing reference point…", 1_500)
+                })
+            }
         }
         Column(
             Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 16.dp),
@@ -593,6 +719,52 @@ fun WayFinderCaptureScreen(
                 ) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { naming = false }) { Text("Cancel") } },
+        )
+    }
+
+    pendingRef?.let { ref ->
+        var refName by remember(ref) { mutableStateOf("") }
+        val quality = when {
+            !ref.accepted -> "Too plain to track — aim at a more detailed, flat spot."
+            ref.detail >= 55 -> "Good detail — trackable"
+            else -> "Low detail — may be unreliable"
+        }
+        AlertDialog(
+            onDismissRequest = { pendingRef = null },
+            title = { Text("Save reference point") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Image(
+                        bitmap = ref.image.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxWidth().height(160.dp).clip(RoundedCornerShape(10.dp)),
+                    )
+                    Text(quality, fontWeight = FontWeight.Bold)
+                    Text("Quality ${ref.detail}/100 · about %.1f m away".format(ref.distanceM))
+                    OutlinedTextField(
+                        value = refName, onValueChange = { refName = it }, singleLine = true,
+                        label = { Text("Name, e.g. Lobby poster") },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = refName.isNotBlank() && ref.accepted,
+                    onClick = {
+                        onSaveReferencePoint(
+                            CapturedReferencePoint(
+                                name = refName.trim(), image = ref.image, physicalWidth = ref.physicalWidth,
+                                level = ref.level, x = ref.x, y = ref.y, z = ref.z, facing = ref.facing,
+                                mounting = Venue.MarkerMounting.WALL,
+                            ),
+                        )
+                        showToast("Reference point “${refName.trim()}” saved", 2_500)
+                        pendingRef = null
+                    },
+                ) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { pendingRef = null }) { Text("Retake") } },
         )
     }
 }

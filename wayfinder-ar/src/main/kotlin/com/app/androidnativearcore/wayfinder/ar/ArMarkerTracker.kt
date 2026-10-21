@@ -146,11 +146,28 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
             if (plane.type != Plane.Type.HORIZONTAL_UPWARD_FACING) continue
             val center = plane.centerPose
             val y = center.ty()
-            if (y > camera.y - 0.8f || y < camera.y - 2.3f) continue
-            if (kotlin.math.hypot((center.tx() - camera.x).toDouble(), (center.tz() - camera.z).toDouble()) > 6.0) continue
+            if (y > camera.y - FLOOR_MIN_BELOW_M || y < camera.y - FLOOR_MAX_BELOW_M) continue
+            if (kotlin.math.hypot((center.tx() - camera.x).toDouble(), (center.tz() - camera.z).toDouble()) > 8.0) continue
             if (lowest == null || y < lowest) lowest = y
         }
         return lowest
+    }
+
+    /**
+     * An instant floor reading that needs no detected plane: a ray straight down from the camera, hit against planes
+     * and the depth map. Planes take seconds to appear; depth answers on the first frames.
+     */
+    fun floorHeightByRay(frame: Frame, camera: Vec3): Float? {
+        val hits = frame.hitTest(floatArrayOf(camera.x, camera.y, camera.z), 0, floatArrayOf(0f, -1f, 0f), 0)
+        for (hit in hits) {
+            val trackable = hit.trackable
+            val usable = (trackable is Plane && trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING && trackable.isPoseInPolygon(hit.hitPose)) ||
+                trackable is DepthPoint
+            if (!usable) continue
+            val y = hit.hitPose.ty()
+            if (y <= camera.y - FLOOR_MIN_BELOW_M && y >= camera.y - FLOOR_MAX_BELOW_M) return y
+        }
+        return null
     }
 
     /**
@@ -189,6 +206,10 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
 
     companion object {
         const val REDETECT_INTERVAL_MS = 1_500L
+
+        /** A floor is between these distances below the phone (tables are higher; lower is a hole or noise). */
+        const val FLOOR_MIN_BELOW_M = 0.5f
+        const val FLOOR_MAX_BELOW_M = 2.8f
 
         /** The wording the iOS app uses for each tracking problem. */
         fun trackingMessage(frame: Frame): String? {
