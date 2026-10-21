@@ -248,6 +248,12 @@ fun WayFinderCaptureScreen(
     onDeleteObject: (id: String) -> Unit = {},
     /** Called when the admin opens the AR Signs gallery directly from the camera HUD. */
     onOpenSigns: (() -> Unit)? = null,
+    /** Called when connecting a walked path to a reference point whose 3D venue position should be updated. */
+    onUpdateReferencePointCoords: (id: String, x: Float, y: Float, z: Float) -> Unit = { _, _, _, _ -> },
+    /** Optional starting reference point ID pre-selected from the Admin Connect panel. */
+    initialFromRefId: String? = null,
+    /** Optional target reference point / object / destination ID pre-selected from the Admin Connect panel. */
+    initialConnectTargetId: String? = null,
     /** Previously saved walked points from earlier destinations, for live in-camera routing preview. */
     existingWalkedPoints: List<WalkedPoint> = emptyList(),
     /** Previously saved 3D objects from earlier destinations, rendered in the live camera video. */
@@ -334,10 +340,12 @@ fun WayFinderCaptureScreen(
     // --- Live "Currently at" & Dropdown Navigation state ---
     var currentAtName by remember { mutableStateOf("Start point") }
     var userVenuePos by remember { mutableStateOf(Vec3.ZERO) }
+    var fromDropdownExpanded by remember { mutableStateOf(false) }
     var navDropdownExpanded by remember { mutableStateOf(false) }
     var selectedNavTarget by remember { mutableStateOf<AdminNavTarget?>(null) }
     var activeRoute by remember { mutableStateOf<Route?>(null) }
     var activeRouteDestPoi by remember { mutableStateOf<Venue.POI?>(null) }
+    val sessionConnectedWalkedPoints = remember(pkg) { mutableStateListOf<WalkedPoint>() }
 
     LaunchedEffect(greenFlash) { if (greenFlash != null) { delay(1500); greenFlash = null } }
 
@@ -558,6 +566,35 @@ fun WayFinderCaptureScreen(
         showToast("Started here — walk, add points or objects, and save!", 2_500)
     }
 
+    /** Sets [pin] as the starting reference point ("From") and anchors the current walk to its venue coordinates. */
+    fun selectStartReferencePoint(pin: RefPin) {
+        val level = defaultLevel.ifEmpty { return }
+        val camSession = Vec3(camera[0], camera[1], camera[2])
+        val candidate = Mat4.yaw(0f, Vec3(camSession.x - pin.x, camSession.y - pin.y, camSession.z - pin.z))
+        filter.reset()
+        repeat(AlignmentFilter.LOCK_IN_SIGHTINGS) {
+            if (filter.update(candidate, 1f, 1f, null)) alignment = filter.alignment
+        }
+        startMarker = Venue.Marker(
+            id = pin.id.ifEmpty { "ref-${pin.name}" },
+            name = LocalizedText(pin.name),
+            image = "",
+            physicalWidth = 0.2f,
+            level = level,
+            x = pin.x, y = pin.y, z = pin.z,
+            facing = 0f,
+            mounting = Venue.MarkerMounting.WALL,
+        )
+        currentAtName = pin.name
+        userVenuePos = Vec3(pin.x, pin.y, pin.z)
+        recorder.clear()
+        committedPath.clear()
+        visits.clear()
+        bootstrapped = true
+        lockedIn = true
+        showToast("Start set to 📍 ${pin.name} — walk to your target & tap Connect!", 3_000)
+    }
+
     fun guideToSession(target: Vec3, name: String) {
         val cam = Vec3(camera[0], camera[1], camera[2])
         val dx = target.x - cam.x
@@ -574,6 +611,127 @@ fun WayFinderCaptureScreen(
             else -> "ahead, on your right"
         }
         showToast("$name · %.1f m · $dir".format(dist), 4_000)
+    }
+
+    /**
+     * Connects the walked path from the current start reference point ([currentAtName] / [startMarker]) to [target]
+     * (another reference point, placed object, or destination), saving a continuous linked [WalkedPoint] run so
+     * [WalkedPathRouter] routes between them in both directions.
+     */
+    fun connectWalkedPathTo(target: AdminNavTarget) {
+        val spot = averageOf(recent) ?: Vec3(camera[0], camera[1], camera[2])
+        recorder.recordAnchor(spot)
+        refreshFromAnchors()
+        val track = buildTrack()
+        val venueFromSession = track.venueFromSessionAt(recorder.progress)
+        val here = venueFromSession.transformPoint(spot)
+        val savedLevel = target.level.ifEmpty { user.level.ifEmpty { defaultLevel } }
+        val floorY = venueFromSession.transformPoint(Vec3(spot.x, floorSessionY(), spot.z)).y
+        val fromMarker = startMarker
+        val fromName = currentAtName.ifBlank { fromMarker?.name?.resolved() ?: "Start point" }
+        val fromPos = if (fromMarker != null) Vec3(fromMarker.x, floorY, fromMarker.z) else Vec3(here.x, floorY, here.z)
+
+        // Convert recorded session points and combine with any already-committed segments
+        val rawConverted = recorder.points.toWalkedPoints(venue, track, savedLevel, floorSessionY())
+        val rawWalk = (committedPath + rawConverted).map { Vec3(it.x, floorY, it.z) }
+
+        // If the target is a reference point that was added from the gallery at (0,0) and we walked away from origin,
+        // update its 3D coordinates to where the admin walked!
+        val isUnpositionedRef = (target.id.startsWith("ref-") || target.id.startsWith("refpin-")) &&
+            hypot(target.x, target.z) < 0.05f && hypot(here.x - fromPos.x, here.z - fromPos.z) > 0.3f
+        val goalPos = if (isUnpositionedRef) {
+            val rawRefId = target.id.removePrefix("ref-").let { if (it.startsWith("ref-")) it else "ref-$it" }
+            onUpdateReferencePointCoords(rawRefId, here.x, here.y, here.z)
+            val idx = sessionRefPins.indexOfFirst { it.name == target.label || it.id == rawRefId }
+            if (idx >= 0) sessionRefPins[idx] = sessionRefPins[idx].copy(x = here.x, y = here.y, z = here.z)
+            else sessionRefPins.add(RefPin(here.x, here.y, here.z, target.label, rawRefId))
+            Vec3(here.x, floorY, here.z)
+        } else {
+            Vec3(target.x, floorY, target.z)
+        }
+
+        // Build a single continuous run: fromPos -> rawWalk -> here -> goalPos with spacing <= 0.5m
+        val runId = SessionPathRecorder.newRunId()
+        val waypoints = mutableListOf<Vec3>()
+        waypoints += fromPos
+        waypoints += rawWalk
+        waypoints += Vec3(here.x, floorY, here.z)
+        if (hypot(goalPos.x - here.x, goalPos.z - here.z) > 0.1f) {
+            waypoints += goalPos
+        }
+
+        val densePoints = mutableListOf<WalkedPoint>()
+        var seq = 0
+        for (i in 0 until waypoints.size - 1) {
+            val a = waypoints[i]
+            val b = waypoints[i + 1]
+            val d = hypot(b.x - a.x, b.z - a.z)
+            if (d > 0.05f) {
+                val seg = straightWalk(a, b, runId, savedLevel, floorY, spacing = 0.4f)
+                for (pt in seg) {
+                    densePoints += WalkedPoint(runId, seq++, savedLevel, pt.x, floorY, pt.z)
+                }
+            }
+        }
+        densePoints += WalkedPoint(runId, seq, savedLevel, goalPos.x, floorY, goalPos.z)
+
+        // Commit objects placed along the walk
+        committedObjects += sessionObjects.map { obj ->
+            val alignmentHere = track.alignmentAt(objectProgress[obj.id] ?: 0f)
+            obj.toVenue(venue, alignmentHere.inverse(), yawDegrees(alignmentHere), savedLevel)
+        }
+        val objectsToSave = committedObjects.toList()
+        sessionObjects.clear()
+        committedObjects.clear()
+        objectProgress.clear()
+        anchors.values.forEach { it.detach() }
+        anchors.clear()
+        recorder.clear()
+        committedPath.clear()
+
+        val connName = "$fromName → ${target.label}"
+        val spreadCm = visits.firstOrNull()?.filter?.spreadCm
+        val drift = driftCm[0].takeIf { it > 0f }
+        onSave(
+            CapturedDestination(
+                name = connName,
+                level = savedLevel,
+                x = goalPos.x,
+                z = goalPos.z,
+                path = densePoints,
+                objects = objectsToSave,
+                floorY = floorY,
+                startMarkerId = fromMarker?.id.orEmpty(),
+                alignmentSpreadCm = spreadCm,
+                driftCorrectedCm = drift,
+            ),
+        )
+        sessionConnectedWalkedPoints.addAll(densePoints)
+        sessionSavedDestinations.add(
+            Venue.POI(
+                id = "custom-session-${sessionSavedDestinations.size}",
+                name = LocalizedText(connName),
+                category = CustomDestination.CATEGORY,
+                level = savedLevel,
+                x = goalPos.x,
+                z = goalPos.z,
+                node = "",
+                elevation = floorY,
+            ),
+        )
+        // Advance start point to the newly connected target so the admin can chain to the next reference point!
+        startMarker = Venue.Marker(
+            id = target.id,
+            name = LocalizedText(target.label),
+            image = "",
+            physicalWidth = 0.2f,
+            level = savedLevel,
+            x = goalPos.x, y = target.y, z = goalPos.z,
+            facing = 0f,
+            mounting = Venue.MarkerMounting.WALL,
+        )
+        currentAtName = target.label
+        greenFlash = "Connected $connName (${densePoints.size} pts)"
     }
 
     /** Plans a live 3D route in the camera to the selected dropdown target. */
@@ -600,11 +758,11 @@ fun WayFinderCaptureScreen(
         )).copy(level = level, elevation = floor)
         activeRouteDestPoi = destPoi
 
-        // Gather all walked points (saved + current session)
+        // Gather all walked points (saved + current session + connected runs)
         val track = buildTrack()
         val currentWalked = recorder.points.toWalkedPoints(venue, track, level, floorSessionY())
-        val allWalked = (existingWalkedPoints + committedPath + currentWalked).filter { it.level == level }
-            .ifEmpty { existingWalkedPoints + committedPath + currentWalked }
+        val combinedWalked = existingWalkedPoints + sessionConnectedWalkedPoints + committedPath + currentWalked
+        val allWalked = combinedWalked.filter { it.level == level }.ifEmpty { combinedWalked }
 
         val route = runCatching {
             if (!destPoi.followsWalkedPaths && destPoi.node.isNotEmpty()) {
@@ -719,6 +877,20 @@ fun WayFinderCaptureScreen(
             )
         }
         list.sortedBy { hypot(it.x - userVenuePos.x, it.z - userVenuePos.z) }
+    }
+
+    LaunchedEffect(initialFromRefId, initialConnectTargetId) {
+        if (!initialFromRefId.isNullOrEmpty()) {
+            allRefPins.firstOrNull { it.id == initialFromRefId || "ref-${it.id}" == initialFromRefId || it.name == initialFromRefId }
+                ?.let { selectStartReferencePoint(it) }
+        }
+        if (!initialConnectTargetId.isNullOrEmpty()) {
+            navTargets.firstOrNull {
+                it.id == initialConnectTargetId ||
+                    it.id.removePrefix("ref-") == initialConnectTargetId.removePrefix("ref-") ||
+                    it.label == initialConnectTargetId
+            }?.let { planToTarget(it) }
+        }
     }
 
     Box(modifier.fillMaxSize().background(Color.Black)) {
@@ -913,20 +1085,65 @@ fun WayFinderCaptureScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("You are currently at", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
-                        Text(
-                            if (hasValidStartRef) "📍 $currentAtName" else "⚠ Start point (No ref image captured yet — tap ◎)",
-                            color = if (hasValidStartRef) Color(0xFF0A84FF) else Color(0xFFFF9500),
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        unusableRefsWarning?.let { bad ->
+                    Box(Modifier.weight(1f)) {
+                        Column(
+                            Modifier.fillMaxWidth()
+                                .clickable { fromDropdownExpanded = true }
+                                .padding(vertical = 2.dp),
+                        ) {
                             Text(
-                                "⚠ Unclear ref image: $bad — tap ◎ to recapture",
-                                color = Color(0xFFFF453A),
+                                "You are currently at (tap to pick start ref ▾)",
+                                color = Color.White.copy(alpha = 0.7f),
                                 fontSize = 11.sp,
                             )
+                            Text(
+                                if (hasValidStartRef) "📍 $currentAtName ▾" else "⚠ Start point (No ref image — tap ◎ or pick ▾)",
+                                color = if (hasValidStartRef) Color(0xFF0A84FF) else Color(0xFFFF9500),
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            unusableRefsWarning?.let { bad ->
+                                Text(
+                                    "⚠ Unclear ref image: $bad — tap ◎ to recapture",
+                                    color = Color(0xFFFF453A),
+                                    fontSize = 11.sp,
+                                )
+                            }
+                        }
+                        DropdownMenu(
+                            expanded = fromDropdownExpanded,
+                            onDismissRequest = { fromDropdownExpanded = false },
+                            modifier = Modifier.fillMaxWidth(0.85f).heightIn(max = 280.dp),
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("⊕ Current standing spot (Start point)", fontWeight = FontWeight.SemiBold) },
+                                onClick = {
+                                    fromDropdownExpanded = false
+                                    startWithoutSign()
+                                },
+                            )
+                            if (allRefPins.isEmpty()) {
+                                DropdownMenuItem(
+                                    text = { Text("No saved reference points yet — tap ◎ to capture one", color = Color.Gray) },
+                                    onClick = { fromDropdownExpanded = false },
+                                )
+                            } else {
+                                allRefPins.forEach { pin ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                "📍 Start from: ${pin.name}",
+                                                color = Color(0xFF0A84FF),
+                                                fontWeight = FontWeight.SemiBold,
+                                            )
+                                        },
+                                        onClick = {
+                                            fromDropdownExpanded = false
+                                            selectStartReferencePoint(pin)
+                                        },
+                                    )
+                                }
+                            }
                         }
                     }
                     Row(
@@ -953,7 +1170,7 @@ fun WayFinderCaptureScreen(
                     }
                 }
 
-                // Dropdown selector for available navigations (destinations, reference points, placed objects)
+                // Dropdown selector for available navigations / targets to walk & connect to
                 Box(Modifier.fillMaxWidth()) {
                     Row(
                         Modifier.fillMaxWidth()
@@ -967,9 +1184,9 @@ fun WayFinderCaptureScreen(
                         Text(
                             if (currentSelection != null) {
                                 val d = hypot(currentSelection.x - userVenuePos.x, currentSelection.z - userVenuePos.z)
-                                "Navigate: ${currentSelection.glyph} ${currentSelection.label} (%.1f m)".format(d)
+                                "Target: ${currentSelection.glyph} ${currentSelection.label} (%.1f m)".format(d)
                             } else {
-                                "Navigate to (${navTargets.size} available)…"
+                                "Walk & Connect / Navigate to (${navTargets.size} available)…"
                             },
                             color = Color.White,
                             fontSize = 14.sp,
@@ -1154,6 +1371,33 @@ fun WayFinderCaptureScreen(
                     }) { Text("Undo", color = Color.White) }
                 }
             }
+            selectedNavTarget?.let { target ->
+                @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(Color(0xFF34C759))
+                        .combinedClickable(
+                            onClick = { connectWalkedPathTo(target) },
+                            onLongClick = {
+                                showToast(
+                                    "Connect walked path: Saves the walked path connecting 📍 $currentAtName to ${target.glyph} ${target.label} so navigation routes between them.",
+                                    3_500,
+                                )
+                            },
+                        )
+                        .padding(vertical = 12.dp, horizontal = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "🔗 Connect walked path: $currentAtName → ${target.label}",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                    )
+                }
+            }
             @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
             Box(
                 Modifier
@@ -1188,11 +1432,26 @@ fun WayFinderCaptureScreen(
                     if (allRefPins.isEmpty()) {
                         Text("None yet. Tap ◎ to capture one.")
                     } else {
+                        Text(
+                            "Tap a point to select it as your target, tap 'Start' to start walking from it, or tap '🔗 Connect' to save the walked path to it.",
+                            fontSize = 12.sp,
+                            color = Color.Gray,
+                        )
                         Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
                             allRefPins.forEach { p ->
                                 val dist = hypot(p.x - userVenuePos.x, p.z - userVenuePos.z)
+                                val targetObj = AdminNavTarget(
+                                    id = p.id.ifEmpty { "refpin-${p.name}" },
+                                    label = p.name,
+                                    glyph = "📍",
+                                    subtitle = "Reference point",
+                                    level = defaultLevel,
+                                    x = p.x,
+                                    y = p.y,
+                                    z = p.z,
+                                )
                                 Row(
-                                    Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
@@ -1202,20 +1461,25 @@ fun WayFinderCaptureScreen(
                                         fontWeight = FontWeight.SemiBold,
                                         modifier = Modifier.weight(1f).clickable {
                                             showPointsList = false
-                                            planToTarget(
-                                                AdminNavTarget(
-                                                    id = "refpin-${p.name}",
-                                                    label = p.name,
-                                                    glyph = "📍",
-                                                    subtitle = "Reference point",
-                                                    level = defaultLevel,
-                                                    x = p.x,
-                                                    y = p.y,
-                                                    z = p.z,
-                                                ),
-                                            )
+                                            planToTarget(targetObj)
                                         },
                                     )
+                                    TextButton(
+                                        onClick = {
+                                            showPointsList = false
+                                            selectStartReferencePoint(p)
+                                        },
+                                    ) {
+                                        Text("Start", color = Color(0xFF0A84FF))
+                                    }
+                                    TextButton(
+                                        onClick = {
+                                            showPointsList = false
+                                            connectWalkedPathTo(targetObj)
+                                        },
+                                    ) {
+                                        Text("🔗 Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold)
+                                    }
                                     TextButton(
                                         onClick = {
                                             if (p.id.isNotEmpty()) deletedRefIds.add(p.id)
@@ -1257,6 +1521,17 @@ fun WayFinderCaptureScreen(
                     Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
                         items.forEach { (obj, inVenue) ->
                             val label = if (obj.text.isNotBlank()) obj.text else obj.kind.label
+                            val vPos = if (inVenue) obj.position else filter.alignment.inverse().transformPoint(obj.position)
+                            val targetObj = AdminNavTarget(
+                                id = obj.id,
+                                label = label,
+                                glyph = obj.kind.glyph,
+                                subtitle = "Placed ${obj.kind.label}",
+                                level = obj.level.ifEmpty { defaultLevel },
+                                x = vPos.x,
+                                y = vPos.y,
+                                z = vPos.z,
+                            )
                             Row(
                                 Modifier.fillMaxWidth().padding(vertical = 6.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1266,21 +1541,17 @@ fun WayFinderCaptureScreen(
                                     "${obj.kind.glyph} $label",
                                     modifier = Modifier.weight(1f).clickable {
                                         showObjectsList = false
-                                        val vPos = if (inVenue) obj.position else filter.alignment.inverse().transformPoint(obj.position)
-                                        planToTarget(
-                                            AdminNavTarget(
-                                                id = obj.id,
-                                                label = label,
-                                                glyph = obj.kind.glyph,
-                                                subtitle = "Placed ${obj.kind.label}",
-                                                level = obj.level.ifEmpty { defaultLevel },
-                                                x = vPos.x,
-                                                y = vPos.y,
-                                                z = vPos.z,
-                                            ),
-                                        )
+                                        planToTarget(targetObj)
                                     },
                                 )
+                                TextButton(
+                                    onClick = {
+                                        showObjectsList = false
+                                        connectWalkedPathTo(targetObj)
+                                    },
+                                ) {
+                                    Text("🔗 Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold)
+                                }
                                 TextButton(
                                     onClick = {
                                         sessionObjects.removeAll { it.id == obj.id }

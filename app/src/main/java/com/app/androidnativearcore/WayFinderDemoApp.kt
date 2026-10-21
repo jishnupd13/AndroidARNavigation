@@ -13,6 +13,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -47,11 +49,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.app.androidnativearcore.ui.designkit.IosRow
 import com.app.androidnativearcore.ui.designkit.IosRowDivider
@@ -67,6 +71,7 @@ import com.app.androidnativearcore.wayfinder.core.ArPathStore
 import com.app.androidnativearcore.wayfinder.core.CapturedMarkerStore
 import com.app.androidnativearcore.wayfinder.core.CustomDestination
 import com.app.androidnativearcore.wayfinder.core.LocalizedText
+import com.app.androidnativearcore.wayfinder.core.PlacedObject
 import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
 import com.app.androidnativearcore.wayfinder.core.Route
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
@@ -86,7 +91,7 @@ private sealed interface Screen {
     data object Home : Screen
     data object List : Screen
     data object Signs : Screen
-    data object Capture : Screen
+    data class Capture(val fromRefId: String? = null, val connectTargetId: String? = null) : Screen
     /** User flow, step 1: the camera recognizes a reference point. */
     data object Locate : Screen
     /** User flow, step 2: every other point reachable from where the user stands. */
@@ -203,7 +208,11 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 onBack = { screen = Screen.Home },
                 onNavigate = { screen = Screen.Navigate(it, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST) },
                 onOpenSigns = { screen = Screen.Signs },
-                onAddDestination = { screen = Screen.Capture },
+                onAddDestination = { screen = Screen.Capture() },
+                onWalkAndConnect = { fromRefId, targetId ->
+                    screen = Screen.Capture(fromRefId = fromRefId, connectTargetId = targetId)
+                },
+                placedObjects = allPlacedObjects,
                 onDeleteDestination = { // deletes that path's file: its walk and objects go with it
                     store.delete(it.id)
                     paths = store.load(basePackage.venue.id)
@@ -228,10 +237,12 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 },
             )
         }
-        Screen.Capture -> WayFinderCaptureScreen(
+        is Screen.Capture -> WayFinderCaptureScreen(
             pkg = pkg,
             existingWalkedPoints = allWalkedPoints,
             existingObjects = allPlacedObjects,
+            initialFromRefId = current.fromRefId,
+            initialConnectTargetId = current.connectTargetId,
             onSave = { captured ->
                 store.save(
                     ArPath(
@@ -274,6 +285,11 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     ),
                 )
                 // Don't refresh `extraMarkers` now: it would rebuild the AR session mid-capture. It reloads on exit.
+            },
+            onUpdateReferencePointCoords = { id, x, y, z ->
+                markerStore.load(basePackage.venue.id).firstOrNull { it.id == id }?.let { existing ->
+                    markerStore.save(basePackage.venue.id, existing.copy(x = x, y = y, z = z))
+                }
             },
             onDeleteReferencePoint = { id, name ->
                 if (id.isNotEmpty()) {
@@ -365,6 +381,8 @@ private fun DestinationListScreen(
     onNavigate: (Venue.POI) -> Unit,
     onOpenSigns: () -> Unit,
     onAddDestination: () -> Unit,
+    onWalkAndConnect: (fromRefId: String?, targetId: String?) -> Unit = { _, _ -> },
+    placedObjects: List<PlacedObject> = emptyList(),
     onDeleteDestination: (Venue.POI) -> Unit,
     onRenameDestination: (Venue.POI, String) -> Unit = { _, _ -> },
     onDataChanged: () -> Unit = {},
@@ -374,13 +392,17 @@ private fun DestinationListScreen(
     val context = LocalContext.current
     val venue = pkg.venue
     val admin = mode == AppMode.ADMIN
-    val capturedCount = venue.markers.count { it.id.startsWith("ref-") }
+    val refMarkers = remember(venue.markers) { venue.markers.filter { it.id.startsWith("ref-") } }
+    val userObjects = remember(placedObjects) { placedObjects.filter { !it.isReference } }
+    val capturedCount = refMarkers.size
     var search by remember { mutableStateOf("") }
     var unsupported by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Venue.POI?>(null) }
     var deleting by remember { mutableStateOf<Venue.POI?>(null) }
     var clearing by remember { mutableStateOf(false) }
     var transferMsg by remember { mutableStateOf<String?>(null) }
+    var showConnectDialog by remember { mutableStateOf(false) }
+    var selectedFromRefId by remember(refMarkers) { mutableStateOf(refMarkers.firstOrNull()?.id) }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -461,6 +483,13 @@ private fun DestinationListScreen(
             if (admin) {
                 item {
                     IosSection {
+                        IosRow(
+                            title = "Connect reference points & objects",
+                            glyph = "🔗",
+                            subtitle = "Walk from one reference point to another ($capturedCount ref pts · ${userObjects.size} objects)",
+                            onClick = { showConnectDialog = true },
+                        )
+                        IosRowDivider()
                         IosRow(title = "Add destination", glyph = "＋", subtitle = "Scan a sign, walk, save a spot", onClick = onAddDestination)
                         IosRowDivider()
                         IosRow(
@@ -469,6 +498,46 @@ private fun DestinationListScreen(
                             subtitle = "Test matching & view the floor map",
                             onClick = onOpenCamera,
                         )
+                    }
+                }
+                if (refMarkers.isNotEmpty() || userObjects.isNotEmpty()) {
+                    item {
+                        IosSection(title = "Reference points & objects (walk & connect)") {
+                            val fromMarker = refMarkers.firstOrNull { it.id == selectedFromRefId } ?: refMarkers.firstOrNull()
+                            val fromLabel = fromMarker?.name?.resolved() ?: "Start point"
+                            refMarkers.forEachIndexed { idx, marker ->
+                                val isStart = marker.id == fromMarker?.id
+                                IosRow(
+                                    title = "📍 ${marker.name.resolved()}",
+                                    glyph = "🔗",
+                                    subtitle = if (isStart) {
+                                        "Selected as Start (From) · Tap to pick target to connect"
+                                    } else {
+                                        "Tap to walk & connect from 📍 $fromLabel → 📍 ${marker.name.resolved()}"
+                                    },
+                                    onClick = {
+                                        if (isStart && refMarkers.size + userObjects.size > 1) {
+                                            showConnectDialog = true
+                                        } else {
+                                            onWalkAndConnect(fromMarker?.id, marker.id)
+                                        }
+                                    },
+                                )
+                                if (idx < refMarkers.lastIndex || userObjects.isNotEmpty()) IosRowDivider()
+                            }
+                            userObjects.forEachIndexed { idx, obj ->
+                                val label = obj.text.ifBlank { obj.kind.label }
+                                IosRow(
+                                    title = "${obj.kind.glyph} $label",
+                                    glyph = "🔗",
+                                    subtitle = "Tap to walk & connect from 📍 $fromLabel → ${obj.kind.glyph} $label",
+                                    onClick = {
+                                        onWalkAndConnect(fromMarker?.id, obj.id)
+                                    },
+                                )
+                                if (idx < userObjects.lastIndex) IosRowDivider()
+                            }
+                        }
                     }
                 }
                 item {
@@ -545,6 +614,146 @@ private fun DestinationListScreen(
                 Spacer(Modifier.padding(8.dp))
             }
         }
+    }
+
+    if (showConnectDialog) {
+        AlertDialog(
+            onDismissRequest = { showConnectDialog = false },
+            title = { Text("Walk & Connect Reference Points / Objects") },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        "1. Pick Starting Reference Point (From):",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                    )
+                    if (refMarkers.isEmpty()) {
+                        Text(
+                            "No reference points captured yet — open the camera and tap ◎ to capture reference points first.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        refMarkers.forEach { m ->
+                            val isSelected = m.id == selectedFromRefId
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelected) Color(0x220A84FF) else Color.Transparent)
+                                    .clickable { selectedFromRefId = m.id }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "📍 ${m.name.resolved()}",
+                                    color = Color(0xFF0A84FF),
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                )
+                                Text(
+                                    if (isSelected) "✓ Start From" else "Select as Start",
+                                    fontSize = 12.sp,
+                                    color = if (isSelected) Color(0xFF0A84FF) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                )
+                            }
+                        }
+                    }
+
+                    Text(
+                        "2. Tap Target Reference Point or Object to Walk & Connect To:",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    val fromName = refMarkers.firstOrNull { it.id == selectedFromRefId }?.name?.resolved() ?: "Start point"
+                    val targetRefs = refMarkers.filter { it.id != selectedFromRefId || refMarkers.size == 1 }
+                    if (targetRefs.isEmpty() && userObjects.isEmpty()) {
+                        Text(
+                            "Tap 'Open Camera' below to capture more reference points or place 3D objects and connect them.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        targetRefs.forEach { target ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0x1834C759))
+                                    .clickable {
+                                        showConnectDialog = false
+                                        onWalkAndConnect(selectedFromRefId, target.id)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "📍 ${target.name.resolved()}",
+                                        color = Color(0xFF0A84FF),
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "Walk from 📍 $fromName → 📍 ${target.name.resolved()}",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                        userObjects.forEach { obj ->
+                            val label = obj.text.ifBlank { obj.kind.label }
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0x1834C759))
+                                    .clickable {
+                                        showConnectDialog = false
+                                        onWalkAndConnect(selectedFromRefId, obj.id)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "${obj.kind.glyph} $label",
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "Walk from 📍 $fromName → ${obj.kind.glyph} $label",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showConnectDialog = false
+                        val defaultTarget = refMarkers.firstOrNull { it.id != selectedFromRefId }?.id
+                            ?: userObjects.firstOrNull()?.id
+                        onWalkAndConnect(selectedFromRefId, defaultTarget)
+                    },
+                ) { Text("Open Camera") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConnectDialog = false }) { Text("Close") }
+            },
+        )
     }
 
     editing?.let { poi ->
