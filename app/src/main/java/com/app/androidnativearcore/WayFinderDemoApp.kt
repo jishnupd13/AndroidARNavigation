@@ -2,6 +2,7 @@ package com.app.androidnativearcore
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
@@ -560,12 +561,21 @@ private fun MarkerGalleryScreen(
 ) {
     val context = LocalContext.current
     var picked by remember { mutableStateOf<Bitmap?>(null) }
+    var choosing by remember { mutableStateOf(false) }
+    var cameraUri by remember { mutableStateOf<Uri?>(null) }
+    fun decode(uri: Uri?): Bitmap? =
+        uri?.let { runCatching { context.contentResolver.openInputStream(it)?.use { s -> BitmapFactory.decodeStream(s) } }.getOrNull() }
     val pickLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) {
-            picked = runCatching {
-                context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
-            }.getOrNull()
-        }
+        if (uri != null) picked = decode(uri)
+    }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok) picked = decode(cameraUri)
+    }
+    fun launchCamera() {
+        val file = File(context.cacheDir, "sign-capture-${System.currentTimeMillis()}.jpg")
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        cameraUri = uri
+        cameraLauncher.launch(uri)
     }
     Scaffold(
         floatingActionButton = {
@@ -573,7 +583,7 @@ private fun MarkerGalleryScreen(
                 ExtendedFloatingActionButton(
                     text = { Text("Add sign") },
                     icon = { Text("＋") },
-                    onClick = { pickLauncher.launch("image/*") },
+                    onClick = { choosing = true },
                 )
             }
         },
@@ -615,6 +625,16 @@ private fun MarkerGalleryScreen(
                 }
             }
         }
+    }
+
+    if (choosing) {
+        AlertDialog(
+            onDismissRequest = { choosing = false },
+            title = { Text("Add AR sign") },
+            text = { Text("Capture a photo now, or pick an existing image.") },
+            confirmButton = { TextButton(onClick = { choosing = false; launchCamera() }) { Text("Camera") } },
+            dismissButton = { TextButton(onClick = { choosing = false; pickLauncher.launch("image/*") }) { Text("Gallery") } },
+        )
     }
 
     picked?.let { bitmap ->
