@@ -24,10 +24,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -69,6 +71,7 @@ import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.math.Position
 import kotlin.math.hypot
+import kotlinx.coroutines.delay
 
 /**
  * A spot the user chose, in venue coordinates, with the walk that leads to it from the sign they scanned and the
@@ -134,6 +137,12 @@ private fun displayRotationDegrees(view: android.view.View): Int = when (view.di
     Surface.ROTATION_270 -> 180
     else -> 90
 }
+
+/** Auto-capture a reference point roughly every this many metres walked (when the toggle is on). */
+private const val AUTO_INTERVAL_M = 3f
+
+/** Don't auto-capture two reference points closer together than this. */
+private const val AUTO_MIN_SEPARATION_M = 2f
 
 /** Shortest recorded walk (meters) that is worth saving as a route. */
 private const val MIN_PATH_LENGTH_M = 1f
@@ -258,6 +267,13 @@ fun WayFinderCaptureScreen(
     var messageText by remember { mutableStateOf("") }
     var pendingRef by remember { mutableStateOf<RefCapture?>(null) } // a captured reference point awaiting naming
     val captureReq = remember { BooleanArray(1) }                    // set when the Add-reference-point button is tapped
+    var autoPoints by remember { mutableStateOf(false) }             // auto-drop reference points while walking (default off)
+    val lastAutoProgress = remember { FloatArray(1) }                // walk distance at the last auto-capture
+    var lastAutoPos by remember { mutableStateOf<Vec3?>(null) }      // venue position of the last auto-captured point
+    val autoCount = remember { IntArray(1) }
+    var greenFlash by remember { mutableStateOf<String?>(null) }     // brief green "captured" confirmation
+
+    LaunchedEffect(greenFlash) { if (greenFlash != null) { delay(1500); greenFlash = null } }
 
     val view = LocalView.current
     DisposableEffect(view) {
@@ -391,21 +407,18 @@ fun WayFinderCaptureScreen(
      * (from depth distance and focal length) and its venue position, scores how trackable it looks, and offers it for
      * saving as a reference point. Aim at a distinctive flat spot, ideally above head height.
      */
-    fun captureReferencePoint(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
+    /** Grabs and measures the spot the center of the screen is aimed at, or null if there's no surface / no image. */
+    fun grabReference(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session): RefCapture? {
         val cameraPosition = Vec3(camera[0], camera[1], camera[2])
         val hit = markerTracker.surfaceAt(frame, session, view.width / 2f, view.height / 2f, MAX_OBJECT_DISTANCE_M)
-        if (hit == null) {
-            showToast("Aim the center at a wall/feature within ${MAX_OBJECT_DISTANCE_M.toInt()} m, then capture.", 3_000)
-            return
-        }
+            ?: return null
         val bitmap = try {
             frame.acquireCameraImage().use { image ->
-                val full = CameraImage.toBitmap(image) ?: return showToast("Couldn't read the camera image. Try again.")
+                val full = CameraImage.toBitmap(image) ?: return null
                 CameraImage.rotate(CameraImage.centerSquare(full, 0.6f), displayRotationDegrees(view))
             }
         } catch (e: Exception) {
-            showToast("Hold still for a moment, then capture again.")
-            return
+            return null
         }
         val intrinsics = frame.camera.imageIntrinsics
         val fx = intrinsics.focalLength[0]
@@ -429,7 +442,37 @@ fun WayFinderCaptureScreen(
             atan2((cameraVenue.x - surfaceVenue.x).toDouble(), (cameraVenue.z - surfaceVenue.z).toDouble()),
         ).toFloat() + 360f) % 360f
         val level = user.level.ifEmpty { startMarker?.level ?: "" }
-        pendingRef = RefCapture(bitmap, physicalWidth, level, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z, facing, detail, accepted, distance)
+        return RefCapture(bitmap, physicalWidth, level, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z, facing, detail, accepted, distance)
+    }
+
+    /** Manual capture: opens the name/quality confirmation dialog, or tells the user to aim somewhere usable. */
+    fun captureReferencePoint(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
+        val ref = grabReference(frame, session)
+        if (ref == null) {
+            showToast("Aim the center at a wall/feature within ${MAX_OBJECT_DISTANCE_M.toInt()} m and hold still.", 3_000)
+            return
+        }
+        pendingRef = ref
+    }
+
+    fun toCaptured(ref: RefCapture, name: String) = CapturedReferencePoint(
+        name = name, image = ref.image, physicalWidth = ref.physicalWidth, level = ref.level,
+        x = ref.x, y = ref.y, z = ref.z, facing = ref.facing, mounting = Venue.MarkerMounting.WALL,
+    )
+
+    /** Auto capture: when enabled, drops a quality-checked reference point every few metres, spaced apart. */
+    fun maybeAutoCapture(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
+        if (!autoPoints) return
+        if (recorder.progress - lastAutoProgress[0] < AUTO_INTERVAL_M) return
+        lastAutoProgress[0] = recorder.progress
+        val ref = grabReference(frame, session) ?: return
+        if (!ref.accepted) return
+        val last = lastAutoPos
+        if (last != null && hypot(ref.x - last.x, ref.z - last.z) < AUTO_MIN_SEPARATION_M) return
+        autoCount[0] = autoCount[0] + 1
+        onSaveReferencePoint(toCaptured(ref, "Auto point ${autoCount[0]}"))
+        lastAutoPos = Vec3(ref.x, ref.y, ref.z)
+        greenFlash = "Reference point added"
     }
 
     Box(modifier.fillMaxSize().background(Color.Black)) {
@@ -542,6 +585,7 @@ fun WayFinderCaptureScreen(
                         captureReq[0] = false
                         captureReferencePoint(frame, session)
                     }
+                    maybeAutoCapture(frame, session)
                 } else {
                     if (pendingTap[2] == 1f) showToast("Tracking is limited right now. Hold still for a moment, then tap again.", 2_500)
                     pendingTap[2] = 0f
@@ -609,6 +653,31 @@ fun WayFinderCaptureScreen(
                     captureReq[0] = true
                     showToast("Hold still — capturing reference point…", 1_500)
                 })
+            }
+        }
+
+        // Auto-points switch, top-right. Off by default; when on, drops quality-checked reference points as you walk.
+        if (lockedIn) {
+            Row(
+                Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(12.dp)
+                    .background(Color(0xAA000000), RoundedCornerShape(20.dp))
+                    .padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Auto points", color = Color.White, fontSize = 13.sp)
+                Switch(checked = autoPoints, onCheckedChange = { autoPoints = it })
+            }
+        }
+
+        // Green confirmation flash on every captured reference point.
+        greenFlash?.let { msg ->
+            Box(
+                Modifier.align(Alignment.TopCenter).safeDrawingPadding().padding(top = 64.dp)
+                    .background(Color(0xFF34C759), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                Text("✓  $msg", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
         Column(
@@ -741,7 +810,7 @@ fun WayFinderCaptureScreen(
                                 mounting = Venue.MarkerMounting.WALL,
                             ),
                         )
-                        showToast("Reference point “${refName.trim()}” saved", 2_500)
+                        greenFlash = "Reference point saved"
                         pendingRef = null
                     },
                 ) { Text("Save") }
