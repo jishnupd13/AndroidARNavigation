@@ -6,6 +6,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
@@ -153,6 +155,10 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     store.delete(it.id)
                     paths = store.load(basePackage.venue.id)
                 },
+                onDataChanged = {
+                    paths = store.load(basePackage.venue.id)
+                    extraMarkers = markerStore.load(basePackage.venue.id)
+                },
             )
         }
         Screen.Capture -> WayFinderCaptureScreen(
@@ -250,6 +256,7 @@ private fun DestinationListScreen(
     onOpenSigns: () -> Unit,
     onAddDestination: () -> Unit,
     onDeleteDestination: (Venue.POI) -> Unit,
+    onDataChanged: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val venue = pkg.venue
@@ -257,6 +264,26 @@ private fun DestinationListScreen(
     var search by remember { mutableStateOf("") }
     var unsupported by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf<Venue.POI?>(null) }
+    var transferMsg by remember { mutableStateOf<String?>(null) }
+
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val count = runCatching { DataTransfer.import(context, uri, context.filesDir) }.getOrElse { -1 }
+            onDataChanged()
+            transferMsg = if (count >= 0) "Loaded $count file(s) from the selected bundle." else "Couldn't read that file."
+        }
+    }
+
+    fun exportData() {
+        val dirs = listOf(File(context.filesDir, "paths"), File(context.filesDir, "captured-markers"))
+        if (dirs.none { it.exists() && it.listFiles().orEmpty().any { f -> f.isFile } }) {
+            transferMsg = "Nothing captured yet to save."
+            return
+        }
+        val zip = runCatching { DataTransfer.export(context, dirs) }.getOrNull()
+        if (zip == null) { transferMsg = "Couldn't create the export."; return }
+        DataTransfer.share(context, zip)
+    }
 
     fun start(poi: Venue.POI) {
         // Like ARWorldTrackingConfiguration.isSupported on iOS: only a device that can't run ARCore is refused.
@@ -297,6 +324,13 @@ private fun DestinationListScreen(
                 item {
                     IosSection {
                         IosRow(title = "Add destination", glyph = "＋", subtitle = "Scan a sign, walk, save a spot", onClick = onAddDestination)
+                    }
+                }
+                item {
+                    IosSection(title = "Data") {
+                        IosRow(title = "Save data", glyph = "⬆", subtitle = "Export points & paths as a file", onClick = { exportData() })
+                        IosRowDivider()
+                        IosRow(title = "Load data", glyph = "⬇", subtitle = "Import a saved bundle", onClick = { importLauncher.launch(arrayOf("application/zip", "*/*")) })
                     }
                 }
             }
@@ -376,6 +410,15 @@ private fun DestinationListScreen(
             onDismissRequest = { unsupported = false },
             title = { Text("AR isn't supported on this device") },
             confirmButton = { TextButton(onClick = { unsupported = false }) { Text("OK") } },
+        )
+    }
+
+    transferMsg?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { transferMsg = null },
+            title = { Text("Data") },
+            text = { Text(msg) },
+            confirmButton = { TextButton(onClick = { transferMsg = null }) { Text("OK") } },
         )
     }
 }

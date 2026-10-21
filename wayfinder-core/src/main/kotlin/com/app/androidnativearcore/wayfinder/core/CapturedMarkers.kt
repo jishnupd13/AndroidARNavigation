@@ -38,19 +38,24 @@ class CapturedMarkerStore(private val directory: File) {
     /** The folder captured images should be written into (same place as the metadata). */
     fun imageFile(id: String): File = File(directory, "$id.png")
 
+    // The image is stored as a bare filename ("<id>.png") so a saved file is portable between devices; on load it is
+    // resolved to the current device's absolute path. Older files that stored an absolute path still work, because the
+    // path is always recomputed from the marker id here.
     fun load(venueId: String): List<Venue.Marker> =
         directory.listFiles { f -> f.isFile && f.name.endsWith(".json") }.orEmpty()
             .mapNotNull { file ->
                 runCatching { json.decodeFromString(StoredMarker.serializer(), file.readText()) }.getOrNull()
             }
             .filter { it.venueId == venueId }
-            .map { it.marker }
+            .map { it.marker.copy(image = imageFile(it.marker.id).absolutePath) }
             .filter { File(it.image).exists() }
 
     fun save(venueId: String, marker: Venue.Marker) {
         val target = File(directory, "${marker.id}.json")
         val tmp = File(directory, "${marker.id}.json.tmp")
-        tmp.writeText(json.encodeToString(StoredMarker.serializer(), StoredMarker(venueId, marker)))
+        // Persist only the filename, not an absolute path, so the JSON is portable.
+        val portable = marker.copy(image = imageFile(marker.id).name)
+        tmp.writeText(json.encodeToString(StoredMarker.serializer(), StoredMarker(venueId, portable)))
         tmp.renameTo(target)
     }
 
