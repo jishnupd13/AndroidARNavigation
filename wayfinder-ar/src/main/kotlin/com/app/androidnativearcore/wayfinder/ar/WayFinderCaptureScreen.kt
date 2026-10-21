@@ -51,6 +51,7 @@ import kotlin.math.atan2
 import kotlin.math.min
 import com.app.androidnativearcore.wayfinder.core.AlignmentFilter
 import com.app.androidnativearcore.wayfinder.core.AlignmentTrack
+import com.app.androidnativearcore.wayfinder.core.LocalizedText
 import com.app.androidnativearcore.wayfinder.core.MarkerAlignment
 import com.app.androidnativearcore.wayfinder.core.Mat4
 import com.app.androidnativearcore.wayfinder.core.PlacedObject
@@ -272,6 +273,7 @@ fun WayFinderCaptureScreen(
     var lastAutoPos by remember { mutableStateOf<Vec3?>(null) }      // venue position of the last auto-captured point
     val autoCount = remember { IntArray(1) }
     var greenFlash by remember { mutableStateOf<String?>(null) }     // brief green "captured" confirmation
+    var bootstrapped by remember { mutableStateOf(false) }           // started mapping without scanning a sign
 
     LaunchedEffect(greenFlash) { if (greenFlash != null) { delay(1500); greenFlash = null } }
 
@@ -475,6 +477,22 @@ fun WayFinderCaptureScreen(
         greenFlash = "Reference point added"
     }
 
+    /**
+     * Starts mapping without an existing sign: the current spot becomes the venue origin (identity alignment), which
+     * unlocks the capture controls so the admin can drop the first reference points. Those captured points (with their
+     * images) then serve as the anchors future sessions scan.
+     */
+    fun startWithoutSign() {
+        val level = venue.levels.firstOrNull()?.id ?: return
+        startMarker = Venue.Marker(
+            id = "origin-bootstrap", name = LocalizedText("Start point"), image = "",
+            physicalWidth = 0.2f, level = level, x = 0f, y = PHONE_HEIGHT_M, z = 0f, facing = 0f,
+            mounting = Venue.MarkerMounting.WALL,
+        )
+        alignment = Mat4.IDENTITY
+        bootstrapped = true
+    }
+
     Box(modifier.fillMaxSize().background(Color.Black)) {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
@@ -547,7 +565,7 @@ fun WayFinderCaptureScreen(
                 lockedIn = filter.isLockedIn
 
                 val marker = startMarker
-                if (marker != null && lockedIn && message == null) {
+                if (marker != null && (lockedIn || bootstrapped) && message == null) {
                     val matrix = FloatArray(16)
                     frame.camera.pose.toMatrix(matrix, 0)
                     camera[0] = matrix[12]; camera[1] = matrix[13]; camera[2] = matrix[14]
@@ -602,7 +620,7 @@ fun WayFinderCaptureScreen(
         }
 
         // Taps on the camera view place the selected object; the controls below sit on top and take their own taps.
-        if (lockedIn) {
+        if (lockedIn || bootstrapped) {
             Box(
                 Modifier.fillMaxSize().pointerInput(Unit) {
                     detectTapGestures { offset ->
@@ -619,7 +637,7 @@ fun WayFinderCaptureScreen(
                         "Face it from 1–2.5 m and move the phone slowly side to side; scanning it starts recording your walk.",
                     signs,
                 )
-                !lockedIn -> GuidanceBannerView(
+                !lockedIn && !bootstrapped -> GuidanceBannerView(
                     GuidanceBanner(
                         instruction = "Locking onto the sign…",
                         glyph = "◎",
@@ -648,7 +666,10 @@ fun WayFinderCaptureScreen(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             CircleButton("✕", "Cancel", onClick = onCancel)
-            if (lockedIn) {
+            if (startMarker == null && !bootstrapped && trackingMessage == null) {
+                CircleButton("⊕", "Start here (no sign)", onClick = { startWithoutSign() })
+            }
+            if (lockedIn || bootstrapped) {
                 CircleButton("◎", "Add reference point", onClick = {
                     captureReq[0] = true
                     showToast("Hold still — capturing reference point…", 1_500)
@@ -657,7 +678,7 @@ fun WayFinderCaptureScreen(
         }
 
         // Auto-points switch, top-right. Off by default; when on, drops quality-checked reference points as you walk.
-        if (lockedIn) {
+        if (lockedIn || bootstrapped) {
             Row(
                 Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(12.dp)
                     .background(Color(0xAA000000), RoundedCornerShape(20.dp))
@@ -686,7 +707,7 @@ fun WayFinderCaptureScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             ToastHost(toast)
-            if (lockedIn) {
+            if (lockedIn || bootstrapped) {
                 if (selectedKind == PlacedObjectKind.MESSAGE) {
                     OutlinedTextField(
                         value = messageText, onValueChange = { messageText = it.take(40) }, singleLine = true,
