@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -276,6 +278,8 @@ fun WayFinderCaptureScreen(
     val autoCount = remember { IntArray(1) }
     var greenFlash by remember { mutableStateOf<String?>(null) }     // brief green "captured" confirmation
     var bootstrapped by remember { mutableStateOf(false) }           // started mapping without scanning a sign
+    var showPointsList by remember { mutableStateOf(false) }
+    var showObjectsList by remember { mutableStateOf(false) }
 
     LaunchedEffect(greenFlash) { if (greenFlash != null) { delay(1500); greenFlash = null } }
 
@@ -497,6 +501,25 @@ fun WayFinderCaptureScreen(
         bootstrapped = true
     }
 
+    /** Shows distance and left/right/ahead guidance from where the phone is now to a point (session coordinates). */
+    fun guideToSession(target: Vec3, name: String) {
+        val cam = Vec3(camera[0], camera[1], camera[2])
+        val dx = target.x - cam.x
+        val dz = target.z - cam.z
+        val dist = hypot(dx, dz)
+        val fwd = user.forward
+        val dot = fwd.x * dx + fwd.z * dz
+        val cross = fwd.x * dz - fwd.z * dx
+        val dir = when {
+            dist < 0.8f -> "you're here"
+            dot <= 0f -> "behind you — turn around"
+            kotlin.math.abs(cross) < dist * 0.35f -> "straight ahead"
+            cross > 0f -> "ahead, on your left"
+            else -> "ahead, on your right"
+        }
+        showToast("$name · %.1f m · $dir".format(dist), 4_000)
+    }
+
     Box(modifier.fillMaxSize().background(Color.Black)) {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
@@ -640,6 +663,24 @@ fun WayFinderCaptureScreen(
         }
 
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
+            // Auto-points switch sits above the banner (its own row) so they never overlap.
+            if (lockedIn || bootstrapped) {
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Row(
+                        Modifier.background(Color(0xAA000000), RoundedCornerShape(20.dp))
+                            .padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Auto points", color = Color.White, fontSize = 13.sp)
+                        Switch(checked = autoPoints, onCheckedChange = { autoPoints = it })
+                    }
+                }
+            }
             when {
                 startMarker == null -> AlignmentPromptView(
                     trackingMessage ?: "Look for a sign like these near entrances, elevators and escalators. " +
@@ -670,49 +711,20 @@ fun WayFinderCaptureScreen(
             }
         }
 
-        Row(
-            Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            CircleButton("✕", "Cancel", onClick = onCancel)
-            if (startMarker == null && !bootstrapped && trackingMessage == null) {
-                CircleButton("⊕", "Start here (no sign)", onClick = { startWithoutSign() })
-            }
-            if (lockedIn || bootstrapped) {
-                CircleButton("◎", "Add reference point", onClick = {
-                    captureReq[0] = true
-                    showToast("Hold still — capturing reference point…", 1_500)
-                })
-            }
-        }
-
-        // Auto-points switch, top-right. Off by default; when on, drops quality-checked reference points as you walk.
-        if (lockedIn || bootstrapped) {
-            Row(
-                Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(12.dp)
-                    .background(Color(0xAA000000), RoundedCornerShape(20.dp))
-                    .padding(start = 12.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Auto points", color = Color.White, fontSize = 13.sp)
-                Switch(checked = autoPoints, onCheckedChange = { autoPoints = it })
-            }
-        }
-
-        // Green confirmation flash on every captured reference point.
+        // Green confirmation flash, centered so it never overlaps the banner or the controls.
         greenFlash?.let { msg ->
             Box(
-                Modifier.align(Alignment.TopCenter).safeDrawingPadding().padding(top = 64.dp)
+                Modifier.align(Alignment.Center)
                     .background(Color(0xFF34C759), RoundedCornerShape(20.dp))
                     .padding(horizontal = 16.dp, vertical = 8.dp),
             ) {
                 Text("✓  $msg", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
+
+        // One bottom panel holds every control, so nothing overlaps.
         Column(
-            Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth().safeDrawingPadding().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             ToastHost(toast)
@@ -721,43 +733,121 @@ fun WayFinderCaptureScreen(
                     OutlinedTextField(
                         value = messageText, onValueChange = { messageText = it.take(40) }, singleLine = true,
                         label = { Text("Message, e.g. Turn left here") },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).background(Color(0xE6FFFFFF), RoundedCornerShape(4.dp)),
+                        modifier = Modifier.fillMaxWidth().background(Color(0xE6FFFFFF), RoundedCornerShape(4.dp)),
                     )
                 }
                 ObjectBar(selected = selectedKind, onSelect = { selectedKind = it })
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (hasUserObjects) {
-                        TextButton(onClick = {
-                            // Removes the last object the user placed; the automatic reference point stays.
-                            val inSession = sessionObjects.indexOfLast { !it.isReference }
-                            if (inSession >= 0) {
-                                val removed = sessionObjects.removeAt(inSession)
-                                anchors.remove(removed.id)?.detach()
-                            } else {
-                                val committed = committedObjects.indexOfLast { !it.isReference }
-                                if (committed >= 0) committedObjects.removeAt(committed)
-                            }
-                        }) { Text("Undo", color = Color.White) }
-                    }
-                    Button(
-                        enabled = canSave && steady && trackingMessage == null,
-                        onClick = {
-                            // The destination is where the phone has been held, averaged over the last moment, so
-                            // hand sway can't move it. It is fixed now, before the name is typed.
-                            pendingDestination = averageOf(recent) ?: user.session
-                            pendingLevel = user.level
-                            pendingFloorSession = floorSessionY()
-                            if (recorder.progress >= 8f && visits.count { it.filter.closeSightings >= 2 } < 2) {
-                                showToast("Tip: scan a sign again at the end next time, to correct drift.", 3_500)
-                            }
-                            naming = true
-                        },
-                    ) {
-                        Text(if (canSave && !steady) "Hold steady…" else "Save destination here")
-                    }
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircleButton("✕", "Cancel", onClick = onCancel)
+                if (startMarker == null && !bootstrapped && trackingMessage == null) {
+                    CircleButton("⊕", "Start here", onClick = { startWithoutSign() })
+                }
+                if (lockedIn || bootstrapped) {
+                    CircleButton("◎", "Add point", onClick = {
+                        captureReq[0] = true
+                        showToast("Hold still — capturing reference point…", 1_500)
+                    })
+                    CircleButton("☰", "Points", onClick = { showPointsList = true })
+                    CircleButton("◳", "Objects", onClick = { showObjectsList = true })
+                }
+                Spacer(Modifier.weight(1f))
+                if ((lockedIn || bootstrapped) && hasUserObjects) {
+                    TextButton(onClick = {
+                        // Removes the last object the user placed; the automatic reference point stays.
+                        val inSession = sessionObjects.indexOfLast { !it.isReference }
+                        if (inSession >= 0) {
+                            val removed = sessionObjects.removeAt(inSession)
+                            anchors.remove(removed.id)?.detach()
+                        } else {
+                            val committed = committedObjects.indexOfLast { !it.isReference }
+                            if (committed >= 0) committedObjects.removeAt(committed)
+                        }
+                    }) { Text("Undo", color = Color.White) }
+                }
+            }
+            if (lockedIn || bootstrapped) {
+                Button(
+                    enabled = canSave && steady && trackingMessage == null,
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = {
+                        // The destination is where the phone has been held, averaged over the last moment, so hand
+                        // sway can't move it. It is fixed now, before the name is typed.
+                        pendingDestination = averageOf(recent) ?: user.session
+                        pendingLevel = user.level
+                        pendingFloorSession = floorSessionY()
+                        if (recorder.progress >= 8f && visits.count { it.filter.closeSightings >= 2 } < 2) {
+                            showToast("Tip: scan a sign again at the end next time, to correct drift.", 3_500)
+                        }
+                        naming = true
+                    },
+                ) {
+                    Text(if (canSave && !steady) "Hold steady…" else "Save destination here")
                 }
             }
         }
+    }
+
+    if (showPointsList) {
+        AlertDialog(
+            onDismissRequest = { showPointsList = false },
+            title = { Text("Reference points (${sessionRefPins.size})") },
+            text = {
+                if (sessionRefPins.isEmpty()) {
+                    Text("None yet. Tap ◎ Add point to capture one.")
+                } else {
+                    Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        sessionRefPins.forEach { p ->
+                            Text(
+                                "📍 ${p.name}",
+                                modifier = Modifier.fillMaxWidth()
+                                    .clickable {
+                                        showPointsList = false
+                                        guideToSession(alignment.transformPoint(Vec3(p.x, p.y, p.z)), p.name)
+                                    }
+                                    .padding(vertical = 12.dp),
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showPointsList = false }) { Text("Close") } },
+        )
+    }
+
+    if (showObjectsList) {
+        val items = sessionObjects.filter { !it.isReference }.map { it to false } +
+            committedObjects.filter { !it.isReference }.map { it to true }
+        AlertDialog(
+            onDismissRequest = { showObjectsList = false },
+            title = { Text("Objects (${items.size})") },
+            text = {
+                if (items.isEmpty()) {
+                    Text("None yet. Pick an object, then tap the view to place it.")
+                } else {
+                    Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                        items.forEach { (obj, inVenue) ->
+                            val label = if (obj.kind == PlacedObjectKind.MESSAGE && obj.text.isNotBlank()) obj.text else obj.kind.label
+                            Text(
+                                "${obj.kind.glyph} $label",
+                                modifier = Modifier.fillMaxWidth()
+                                    .clickable {
+                                        showObjectsList = false
+                                        val tgt = if (inVenue) alignment.transformPoint(obj.position) else obj.position
+                                        guideToSession(tgt, label)
+                                    }
+                                    .padding(vertical = 12.dp),
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showObjectsList = false }) { Text("Close") } },
+        )
     }
 
     if (naming) {
