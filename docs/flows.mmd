@@ -1,0 +1,49 @@
+flowchart TD
+    Open["App Open"] --> Gate["Mode Gate"]
+    Gate --> User["User Mode"]
+    Gate --> Admin["Admin Mode"]
+
+    subgraph USER["User Flow"]
+        User --> UScan["Scan Point"]
+        UScan --> UNear["Nearby List"]
+        UNear --> UPick["Pick Place"]
+        UPick --> UNav["AR Navigate"]
+        UNav --> UArrive["You Arrived"]
+    end
+
+    subgraph ADMIN["Admin Flow"]
+        Admin --> Places["Places List"]
+        Places --> NewP["New Place"]
+        Places --> OpenP["Open Place"]
+        Places --> Signs["AR Signs"]
+        Places --> Floor["Floor Plan"]
+        Places --> Export["Export Data"]
+        Places --> Import["Import Data"]
+    end
+
+    subgraph CAP["Capture Mode"]
+        NewP --> Warm["Warm Up"]
+        OpenP --> Warm
+        Warm --> Scan["Scan Sign"]
+        Scan --> Lock["Lock In"]
+        Lock --> Walk["Walk Through"]
+        Walk --> AddPt["Add Point"]
+        Walk --> TagObj["Tag Object"]
+        Walk --> Connect["Connect Point"]
+        AddPt --> Snap["Snap Photo"]
+        Snap --> Qual["Check Quality"]
+        Qual --> NameIt["Name Save"]
+        NameIt --> Walk
+        TagObj --> Walk
+        Connect --> Walk
+        Walk --> SaveP["Save Place"]
+        SaveP --> Places
+    end
+
+    UNav -. "gap bridge" .-> PDR["Bridge PDR"]
+
+    classDef built fill:#34C759,stroke:#1f7a35,color:#fff;
+    classDef plan fill:#C7C7CC,stroke:#8E8E93,color:#1c1c1e;
+
+    class Open,Gate,User,Admin,UNav,UArrive,Signs,Scan,Lock,Walk,TagObj,AddPt,Snap,Qual,NameIt,SaveP built;
+    class UScan,UNear,UPick,Places,NewP,OpenP,Floor,Export,Import,Connect,PDR plan;
