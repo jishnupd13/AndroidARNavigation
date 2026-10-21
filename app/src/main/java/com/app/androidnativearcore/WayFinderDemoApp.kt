@@ -155,6 +155,14 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     store.delete(it.id)
                     paths = store.load(basePackage.venue.id)
                 },
+                onRenameDestination = { poi, newName ->
+                    paths.firstOrNull { it.destination.id == poi.id }?.let { path ->
+                        // Same id, new name: remove the old file (named by the old slug) then save under the new one.
+                        store.delete(poi.id)
+                        store.save(path.copy(destination = path.destination.copy(name = newName)))
+                        paths = store.load(basePackage.venue.id)
+                    }
+                },
                 onDataChanged = {
                     paths = store.load(basePackage.venue.id)
                     extraMarkers = markerStore.load(basePackage.venue.id)
@@ -256,6 +264,7 @@ private fun DestinationListScreen(
     onOpenSigns: () -> Unit,
     onAddDestination: () -> Unit,
     onDeleteDestination: (Venue.POI) -> Unit,
+    onRenameDestination: (Venue.POI, String) -> Unit = { _, _ -> },
     onDataChanged: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -263,6 +272,7 @@ private fun DestinationListScreen(
     val admin = mode == AppMode.ADMIN
     var search by remember { mutableStateOf("") }
     var unsupported by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<Venue.POI?>(null) }
     var deleting by remember { mutableStateOf<Venue.POI?>(null) }
     var transferMsg by remember { mutableStateOf<String?>(null) }
 
@@ -373,7 +383,7 @@ private fun DestinationListScreen(
                             POIRow(
                                 poi = poi,
                                 onClick = { start(poi) },
-                                onLongClick = if (admin && poi.category == CustomDestination.CATEGORY) ({ deleting = poi }) else null,
+                                onLongClick = if (admin && poi.category == CustomDestination.CATEGORY) ({ editing = poi }) else null,
                             )
                             if (index < pois.lastIndex) IosRowDivider()
                         }
@@ -393,6 +403,32 @@ private fun DestinationListScreen(
                 Spacer(Modifier.padding(8.dp))
             }
         }
+    }
+
+    editing?.let { poi ->
+        var name by remember(poi) { mutableStateOf(poi.name.resolved()) }
+        AlertDialog(
+            onDismissRequest = { editing = null },
+            title = { Text("Edit destination") },
+            text = {
+                OutlinedTextField(
+                    value = name, onValueChange = { name = it }, singleLine = true,
+                    label = { Text("Name") },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = name.isNotBlank() && name.trim() != poi.name.resolved(),
+                    onClick = { onRenameDestination(poi, name.trim()); editing = null },
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { editing = null; deleting = poi }) { Text("Delete") }
+                    TextButton(onClick = { editing = null }) { Text("Cancel") }
+                }
+            },
+        )
     }
 
     deleting?.let { poi ->
@@ -443,7 +479,7 @@ private fun POIRow(poi: Venue.POI, onClick: () -> Unit, onLongClick: (() -> Unit
         Column(Modifier.weight(1f)) {
             Text(poi.name.resolved(), style = MaterialTheme.typography.bodyLarge)
             if (poi.category == CustomDestination.CATEGORY && onLongClick != null) {
-                Text("Hold to delete", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Hold to edit", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         Text("AR ›", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
