@@ -235,6 +235,8 @@ fun WayFinderCaptureScreen(
     val committedObjects = remember(pkg) { mutableStateListOf<PlacedObject>() }
     // Objects placed since the last commit, in session coordinates (so no alignment change can shift them).
     val sessionObjects = remember(pkg) { mutableStateListOf<PlacedObject>() }
+    // Reference points captured this session (venue coordinates), shown as pins in the camera.
+    val sessionRefPins = remember(pkg) { mutableStateListOf<RefPin>() }
     // ARCore keeps anchors glued to the real world as its tracking improves; objects follow their anchors.
     val anchors = remember(pkg) { HashMap<String, Anchor>() }
     val camera = remember { FloatArray(3) }       // camera position in the session
@@ -472,7 +474,9 @@ fun WayFinderCaptureScreen(
         val last = lastAutoPos
         if (last != null && hypot(ref.x - last.x, ref.z - last.z) < AUTO_MIN_SEPARATION_M) return
         autoCount[0] = autoCount[0] + 1
-        onSaveReferencePoint(toCaptured(ref, "Auto point ${autoCount[0]}"))
+        val autoName = "Auto point ${autoCount[0]}"
+        onSaveReferencePoint(toCaptured(ref, autoName))
+        sessionRefPins.add(RefPin(ref.x, ref.y, ref.z, autoName))
         lastAutoPos = Vec3(ref.x, ref.y, ref.z)
         greenFlash = "Reference point added"
     }
@@ -600,8 +604,11 @@ fun WayFinderCaptureScreen(
                         handleTap(frame, session, pendingTap[0], pendingTap[1])
                     }
                     if (captureReq[0]) {
-                        captureReq[0] = false
-                        captureReferencePoint(frame, session)
+                        // Wait for a steady frame so the saved reference image is sharp, not motion-blurred.
+                        if (steady) {
+                            captureReq[0] = false
+                            captureReferencePoint(frame, session)
+                        }
                     }
                     maybeAutoCapture(frame, session)
                 } else {
@@ -617,6 +624,8 @@ fun WayFinderCaptureScreen(
             // Already-converted objects live in the venue frame; newer ones in the session frame (identity root).
             ObjectsScene(committedObjects.toList(), alignment, cameraPosition)
             ObjectsScene(sessionObjects.toList(), Mat4.IDENTITY, cameraPosition)
+            // Reference points captured this session, shown as green pins with their names.
+            ReferencePointsScene(sessionRefPins.toList(), alignment, cameraPosition)
         }
 
         // Taps on the camera view place the selected object; the controls below sit on top and take their own taps.
@@ -831,6 +840,7 @@ fun WayFinderCaptureScreen(
                                 mounting = Venue.MarkerMounting.WALL,
                             ),
                         )
+                        sessionRefPins.add(RefPin(ref.x, ref.y, ref.z, refName.trim()))
                         greenFlash = "Reference point saved"
                         pendingRef = null
                     },
