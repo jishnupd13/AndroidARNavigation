@@ -103,11 +103,12 @@ fun WayFinderNavigationScreen(
     val state = controller.uiState
     val activeDestination = controller.destination
     val signs = remember(pkg) {
-        pkg.venue.markers.take(8).mapNotNull { marker ->
+        pkg.venue.markers.mapNotNull { marker ->
             BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
         }
     }
     var showFeedback by remember { mutableStateOf(false) }
+    var showNavHelp by remember { mutableStateOf(false) }
     var dropdownExpanded by remember { mutableStateOf(false) }
 
     // Reference points to render in blue in the live camera video
@@ -221,13 +222,27 @@ fun WayFinderNavigationScreen(
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Text("You are currently at", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
-                Text(
-                    "📍 $currentAtName",
-                    color = Color(0xFF0A84FF),
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                )
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("You are currently at", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                        Text(
+                            "📍 $currentAtName",
+                            color = Color(0xFF0A84FF),
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    CircleButton(
+                        glyph = "ⓘ",
+                        description = "Navigation Help: Tap to see what each control on this screen does",
+                        onClick = { showNavHelp = true },
+                        onLongPress = { controller.showToast(it, 3_500) },
+                    )
+                }
 
                 // Destination / Reference Point / Object Dropdown
                 Box(Modifier.fillMaxWidth()) {
@@ -324,8 +339,24 @@ fun WayFinderNavigationScreen(
             Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            CircleButton("✕", "Close navigation", onClick = controller::finish)
-            CircleButton("!", "Report a problem", onClick = { showFeedback = true })
+            CircleButton(
+                glyph = "✕",
+                description = "Close navigation: Exit the live AR camera and return to the list",
+                onClick = controller::finish,
+                onLongPress = { controller.showToast(it, 3_500) },
+            )
+            CircleButton(
+                glyph = "!",
+                description = "Report a problem: Report a blocked route, missing sign, or wrong directions",
+                onClick = { showFeedback = true },
+                onLongPress = { controller.showToast(it, 3_500) },
+            )
+            CircleButton(
+                glyph = "ⓘ",
+                description = "Help Guide: View info on what every button and indicator does",
+                onClick = { showNavHelp = true },
+                onLongPress = { controller.showToast(it, 3_500) },
+            )
         }
         Column(
             Modifier.align(Alignment.BottomEnd).safeDrawingPadding().padding(16.dp),
@@ -357,6 +388,24 @@ fun WayFinderNavigationScreen(
             },
             confirmButton = {},
             dismissButton = { TextButton(onClick = { showFeedback = false }) { Text("Cancel") } },
+        )
+    }
+
+    if (showNavHelp) {
+        AlertDialog(
+            onDismissRequest = { showNavHelp = false },
+            title = { Text("AR Navigation Guide") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Tip: Long-press any button on the camera view for quick info!", fontSize = 13.sp, color = Color(0xFF0A84FF), fontWeight = FontWeight.SemiBold)
+                    Text("• 📍 You are currently at:\nShows the reference point or sign the camera matched (or the nearest reference point as you walk).")
+                    Text("• Navigate to ▾ (Dropdown):\nPick any saved destination (⭐), reference point (📍 in blue), or placed 3D object to immediately draw 3D route arrows in the live camera.")
+                    Text("• Blue 3D Pins (📍):\nReference points placed around the room, shown with blue floating labels.")
+                    Text("• ✕ (Close):\nExits the camera view back to the destination list.")
+                    Text("• ! (Report a problem):\nReport a blocked route, missing sign, or inaccurate directions.")
+                }
+            },
+            confirmButton = { TextButton(onClick = { showNavHelp = false }) { Text("Got it") } },
         )
     }
 }

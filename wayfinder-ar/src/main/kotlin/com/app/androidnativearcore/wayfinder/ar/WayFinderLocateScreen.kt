@@ -53,7 +53,7 @@ fun WayFinderLocateScreen(
     val venue = pkg.venue
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
     val signs = remember(pkg) {
-        venue.markers.take(8).mapNotNull { marker ->
+        venue.markers.mapNotNull { marker ->
             BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
         }
     }
@@ -134,7 +134,12 @@ fun WayFinderLocateScreen(
             }
         }
         Box(Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(16.dp)) {
-            CircleButton("✕", "Cancel", onClick = onCancel)
+            CircleButton(
+                glyph = "✕",
+                description = "Cancel: Exit camera and return to the destination list",
+                onClick = onCancel,
+                onLongPress = { toast = Toast((toast?.id ?: 0) + 1, it, 3_500) },
+            )
         }
         Column(Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(bottom = 16.dp)) { ToastHost(toast) }
     }

@@ -15,16 +15,21 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -269,6 +274,27 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     ),
                 )
                 // Don't refresh `extraMarkers` now: it would rebuild the AR session mid-capture. It reloads on exit.
+            },
+            onDeleteReferencePoint = { id, name ->
+                if (id.isNotEmpty()) {
+                    markerStore.delete(id)
+                } else {
+                    markerStore.load(basePackage.venue.id)
+                        .filter { it.name.resolved() == name }
+                        .forEach { markerStore.delete(it.id) }
+                }
+            },
+            onDeleteObject = { objId ->
+                store.load(basePackage.venue.id).forEach { path ->
+                    if (path.objects.any { it.id == objId }) {
+                        store.save(path.copy(objects = path.objects.filterNot { it.id == objId }))
+                    }
+                }
+            },
+            onOpenSigns = {
+                paths = store.load(basePackage.venue.id)
+                extraMarkers = markerStore.load(basePackage.venue.id)
+                screen = Screen.Signs
             },
         )
         Screen.Signs -> {
@@ -676,11 +702,18 @@ private fun MarkerGalleryScreen(
                 val bitmap = remember(marker) { BitmapFactory.decodeFile(pkg.file(marker).path) }
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (bitmap != null) {
+                        val ratio = remember(bitmap) {
+                            (bitmap.width.toFloat() / bitmap.height.toFloat().coerceAtLeast(1f)).coerceIn(0.4f, 2.5f)
+                        }
                         Image(
                             bitmap = bitmap.asImageBitmap(),
                             contentDescription = marker.name.resolved(),
-                            contentScale = ContentScale.FillWidth,
-                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 260.dp)
+                                .aspectRatio(ratio)
+                                .clip(RoundedCornerShape(12.dp)),
                         )
                     }
                     Text(marker.name.resolved(), style = MaterialTheme.typography.titleMedium)
@@ -717,29 +750,56 @@ private fun MarkerGalleryScreen(
     picked?.let { bitmap ->
         var name by remember(bitmap) { mutableStateOf("") }
         var widthCm by remember(bitmap) { mutableStateOf("20") }
+        val ratio = remember(bitmap) {
+            (bitmap.width.toFloat() / bitmap.height.toFloat().coerceAtLeast(1f)).coerceIn(0.4f, 2.5f)
+        }
         AlertDialog(
             onDismissRequest = { picked = null },
             title = { Text("Add AR sign") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Image(
-                        bitmap = bitmap.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
-                    )
-                    OutlinedTextField(value = name, onValueChange = { name = it }, singleLine = true, label = { Text("Name") })
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .heightIn(max = 180.dp)
+                                .aspectRatio(ratio)
+                                .clip(RoundedCornerShape(10.dp)),
+                        )
+                    }
                     OutlinedTextField(
-                        value = widthCm, onValueChange = { widthCm = it.filter(Char::isDigit).take(4) },
-                        singleLine = true, label = { Text("Printed width (cm)") },
+                        value = name,
+                        onValueChange = { name = it },
+                        singleLine = true,
+                        label = { Text("Name (required)") },
+                        placeholder = { Text("e.g. Room door sign") },
+                        modifier = Modifier.fillMaxWidth(),
                     )
-                    Text("Position isn't set — scan this sign in capture to place it accurately.",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedTextField(
+                        value = widthCm,
+                        onValueChange = { widthCm = it.filter(Char::isDigit).take(4) },
+                        singleLine = true,
+                        label = { Text("Physical width (cm)") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "Position isn't set — scan this sign in capture to place it accurately.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             },
             confirmButton = {
-                val cm = widthCm.toFloatOrNull() ?: 0f
+                val cm = (widthCm.toFloatOrNull() ?: 20f).coerceAtLeast(1f)
+                val resolvedName = name.trim().ifEmpty { "Sign ${pkg.venue.markers.size + 1}" }
                 TextButton(
-                    enabled = name.isNotBlank() && cm > 0f && onAddSign != null,
-                    onClick = { onAddSign?.invoke(name.trim(), cm / 100f, bitmap); picked = null },
+                    enabled = onAddSign != null,
+                    onClick = { onAddSign?.invoke(resolvedName, cm / 100f, bitmap); picked = null },
                 ) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { picked = null }) { Text("Cancel") } },

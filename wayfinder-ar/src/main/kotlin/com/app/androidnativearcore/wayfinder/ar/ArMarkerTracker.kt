@@ -42,12 +42,16 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
     private val markersByID = pkg.venue.markers.associateBy { it.id }
     private val lastReportedMs = HashMap<String, Long>()
 
+    /** Markers successfully added to the ARCore AugmentedImageDatabase. */
+    val usableMarkers = mutableListOf<Venue.Marker>()
+
     /** Markers whose image ARCore rejected (too few features); the others still work. */
     val unusableMarkers = mutableListOf<Pair<Venue.Marker, String>>()
 
     /** Call from the session configuration callback, before the session resumes. */
     fun configure(session: Session, config: Config, aiming: Boolean = false) {
         val database = AugmentedImageDatabase(session)
+        usableMarkers.clear()
         unusableMarkers.clear()
         for (marker in pkg.venue.markers) {
             val bitmap = BitmapFactory.decodeFile(pkg.file(marker).path)
@@ -57,6 +61,7 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
             }
             try {
                 database.addImage(marker.id, bitmap, marker.physicalWidth)
+                usableMarkers += marker
             } catch (e: Exception) {
                 unusableMarkers += marker to (e.message ?: e.javaClass.simpleName)
             }

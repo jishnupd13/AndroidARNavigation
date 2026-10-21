@@ -4,9 +4,11 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.view.Surface
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +16,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -239,6 +242,12 @@ fun WayFinderCaptureScreen(
     modifier: Modifier = Modifier,
     /** Called when the admin captures and confirms a reference point; the caller persists it. */
     onSaveReferencePoint: (CapturedReferencePoint) -> Unit = {},
+    /** Called when the admin deletes a reference point from the in-camera Points list. */
+    onDeleteReferencePoint: (id: String, name: String) -> Unit = { _, _ -> },
+    /** Called when the admin deletes a previously saved object from the in-camera Objects list. */
+    onDeleteObject: (id: String) -> Unit = {},
+    /** Called when the admin opens the AR Signs gallery directly from the camera HUD. */
+    onOpenSigns: (() -> Unit)? = null,
     /** Previously saved walked points from earlier destinations, for live in-camera routing preview. */
     existingWalkedPoints: List<WalkedPoint> = emptyList(),
     /** Previously saved 3D objects from earlier destinations, rendered in the live camera video. */
@@ -249,7 +258,7 @@ fun WayFinderCaptureScreen(
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
     val planner = remember(venue) { RoutePlanner(venue) }
     val signs = remember(pkg) {
-        venue.markers.take(6).mapNotNull { marker ->
+        venue.markers.mapNotNull { marker ->
             BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
         }
     }
@@ -319,6 +328,8 @@ fun WayFinderCaptureScreen(
     var bootstrapped by remember { mutableStateOf(true) }
     var showPointsList by remember { mutableStateOf(false) }
     var showObjectsList by remember { mutableStateOf(false) }
+    var showHelpGuide by remember { mutableStateOf(false) }
+    var unusableRefsWarning by remember { mutableStateOf<String?>(null) }
 
     // --- Live "Currently at" & Dropdown Navigation state ---
     var currentAtName by remember { mutableStateOf("Start point") }
@@ -351,25 +362,31 @@ fun WayFinderCaptureScreen(
     fun yawDegrees(m: Mat4) = Math.toDegrees(AlignmentFilter.yaw(m).toDouble()).toFloat()
 
     val hasUserObjects = sessionObjects.any { !it.isReference } || committedObjects.any { !it.isReference }
+    val deletedRefIds = remember(pkg) { mutableStateListOf<String>() }
+    val deletedRefNames = remember(pkg) { mutableStateListOf<String>() }
+    val deletedObjectIds = remember(pkg) { mutableStateListOf<String>() }
 
     // Combine saved reference points from venue + newly captured reference points in this session (deduped by name/pos).
-    val allRefPins = remember(venue.markers, sessionRefPins.size) {
-        val fromVenue = venue.markers.filter { it.id.startsWith("ref-") }.map {
-            RefPin(it.x, it.y, it.z, it.name.resolved())
-        }
+    val allRefPins = remember(venue.markers, sessionRefPins.size, deletedRefIds.size, deletedRefNames.size) {
+        val fromVenue = venue.markers
+            .filter { it.id.startsWith("ref-") && it.id !in deletedRefIds && it.name.resolved() !in deletedRefNames }
+            .map { RefPin(it.x, it.y, it.z, it.name.resolved(), it.id) }
         val combined = mutableListOf<RefPin>()
         combined.addAll(fromVenue)
         for (pin in sessionRefPins) {
-            if (combined.none { it.name == pin.name && hypot(it.x - pin.x, it.z - pin.z) < 0.2f }) {
+            if (pin.name !in deletedRefNames && combined.none { it.name == pin.name && hypot(it.x - pin.x, it.z - pin.z) < 0.2f }) {
                 combined.add(pin)
             }
         }
         combined
     }
+    val hasValidStartRef = remember(allRefPins.size, lockedIn) {
+        lockedIn || allRefPins.isNotEmpty()
+    }
 
     // All venue-frame objects (saved from previous paths + committed in this session).
-    val allVenueObjects = remember(existingObjects, committedObjects.size) {
-        existingObjects + committedObjects
+    val allVenueObjects = remember(existingObjects, committedObjects.size, deletedObjectIds.size) {
+        (existingObjects + committedObjects).filter { it.id !in deletedObjectIds }
     }
 
     fun committedLength(): Float =
@@ -567,11 +584,11 @@ fun WayFinderCaptureScreen(
             activeRouteDestPoi = null
             return
         }
-        val level = user.level.ifEmpty { target.level.ifEmpty { defaultLevel } }
-        val floor = venue.level(level)?.elevation ?: 0f
+        val level = target.level.ifEmpty { user.level.ifEmpty { defaultLevel } }
+        val floor = target.poi?.elevation ?: floorSessionY()
         val start = Vec3(user.venueX, floor, user.venueZ)
         val goal = Vec3(target.x, floor, target.z)
-        val destPoi = target.poi ?: Venue.POI(
+        val destPoi = (target.poi ?: Venue.POI(
             id = target.id,
             name = LocalizedText(target.label),
             category = CustomDestination.CATEGORY,
@@ -580,24 +597,40 @@ fun WayFinderCaptureScreen(
             z = target.z,
             node = "",
             elevation = floor,
-        )
+        )).copy(level = level, elevation = floor)
         activeRouteDestPoi = destPoi
 
         // Gather all walked points (saved + current session)
         val track = buildTrack()
         val currentWalked = recorder.points.toWalkedPoints(venue, track, level, floorSessionY())
         val allWalked = (existingWalkedPoints + committedPath + currentWalked).filter { it.level == level }
+            .ifEmpty { existingWalkedPoints + committedPath + currentWalked }
 
         val route = runCatching {
             if (!destPoi.followsWalkedPaths && destPoi.node.isNotEmpty()) {
                 planner.route(start, level, toPOI = destPoi.id, profile = RouteProfile.FASTEST)
             } else {
-                val res = WalkedPathRouter(startJoinDistance = 5f, destinationJoinDistance = 5f).route(start, goal, allWalked)
+                val res = WalkedPathRouter(startJoinDistance = 12f, destinationJoinDistance = 12f).route(start, goal, allWalked)
                 when (res) {
                     is WalkedRouteResult.Success -> planner.routeAlong(res.points, level, RouteProfile.FASTEST)
                     is WalkedRouteResult.Failure -> {
-                        val straight = straightWalk(start, goal, "direct", level, floor).map { it.position } + goal
-                        planner.routeAlong(straight, level, RouteProfile.FASTEST)
+                        val matchingRun = allWalked.filter { it.destinationId == destPoi.id }.sortedBy { it.sequence }
+                            .ifEmpty {
+                                allWalked.groupBy { it.run }.values
+                                    .map { run -> run.sortedBy { it.sequence } }
+                                    .minByOrNull { run -> run.last().position.distanceTo(goal) }
+                                    ?.takeIf { run -> run.last().position.distanceTo(goal) <= 5f }
+                                    .orEmpty()
+                            }
+                        if (matchingRun.size >= 2) {
+                            val closestIdx = matchingRun.indices.minByOrNull { matchingRun[it].position.distanceTo(start) } ?: 0
+                            val lead = straightWalk(start, matchingRun[closestIdx].position, "lead", level, floor).map { it.position }
+                            val tail = matchingRun.drop(closestIdx).map { Vec3(it.x, floor, it.z) } + goal
+                            planner.routeAlong((lead + tail).distinct(), level, RouteProfile.FASTEST)
+                        } else {
+                            val straight = straightWalk(start, goal, "direct", level, floor).map { it.position } + goal
+                            planner.routeAlong(straight, level, RouteProfile.FASTEST)
+                        }
                     }
                 }
             }
@@ -694,8 +727,14 @@ fun WayFinderCaptureScreen(
             sessionCameraConfig = null,
             sessionConfiguration = { session, config ->
                 markerTracker.configure(session, config, aiming = true)
+                val badRefs = markerTracker.unusableMarkers.filter { it.first.id.startsWith("ref-") }
+                if (badRefs.isNotEmpty()) {
+                    unusableRefsWarning = badRefs.joinToString(", ") { "“${it.first.name.resolved()}”" }
+                } else {
+                    unusableRefsWarning = null
+                }
                 markerTracker.unusableMarkers.firstOrNull()?.let { (marker, reason) ->
-                    showToast("AR sign “${marker.name.resolved()}” can't be used: $reason", 6_000)
+                    showToast("Ref/Sign “${marker.name.resolved()}” wasn't captured clearly ($reason) — retake with ◎", 5_000)
                 }
             },
             onSessionUpdated = { session, frame ->
@@ -834,7 +873,7 @@ fun WayFinderCaptureScreen(
             if (activeRoute != null && routeDest != null) {
                 RouteScene(
                     route = activeRoute,
-                    level = user.level.ifEmpty { defaultLevel },
+                    level = activeRoute?.levels?.firstOrNull() ?: routeDest.level.ifEmpty { defaultLevel },
                     venue = venue,
                     destination = routeDest,
                     alignment = alignment,
@@ -877,18 +916,40 @@ fun WayFinderCaptureScreen(
                     Column(Modifier.weight(1f)) {
                         Text("You are currently at", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
                         Text(
-                            "📍 $currentAtName",
-                            color = Color(0xFF0A84FF),
-                            fontSize = 17.sp,
+                            if (hasValidStartRef) "📍 $currentAtName" else "⚠ Start point (No ref image captured yet — tap ◎)",
+                            color = if (hasValidStartRef) Color(0xFF0A84FF) else Color(0xFFFF9500),
+                            fontSize = 16.sp,
                             fontWeight = FontWeight.Bold,
                         )
+                        unusableRefsWarning?.let { bad ->
+                            Text(
+                                "⚠ Unclear ref image: $bad — tap ◎ to recapture",
+                                color = Color(0xFFFF453A),
+                                fontSize = 11.sp,
+                            )
+                        }
                     }
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Text("Auto points", color = Color.White, fontSize = 12.sp)
+                        @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+                        Text(
+                            "Auto points",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            modifier = Modifier.combinedClickable(
+                                onClick = { autoPoints = !autoPoints },
+                                onLongClick = { showToast("Auto points: Automatically captures & saves a reference point every 3 meters as you walk.", 3_500) },
+                            ),
+                        )
                         Switch(checked = autoPoints, onCheckedChange = { autoPoints = it })
+                        CircleButton(
+                            glyph = "ⓘ",
+                            description = "Button Guide: Tap to see what every button does",
+                            onClick = { showHelpGuide = true },
+                            onLongPress = { showToast(it, 3_500) },
+                        )
                     }
                 }
 
@@ -1025,20 +1086,59 @@ fun WayFinderCaptureScreen(
                     onDone = { namingObjectId = null },
                 )
             }
-            ObjectBar(selected = selectedKind, onSelect = { selectedKind = it })
+            ObjectBar(
+                selected = selectedKind,
+                onSelect = { selectedKind = it },
+                onLongPress = { kind ->
+                    showToast("${kind.glyph} ${kind.label}: Select this, then tap anywhere on the camera video to place a 3D ${kind.label} in the room.", 3_500)
+                },
+            )
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                CircleButton("✕", "Exit camera", onClick = onCancel)
-                CircleButton("⊕", "Start here", onClick = { startWithoutSign() })
-                CircleButton("◎", "Add reference point", onClick = {
-                    captureReq[0] = true
-                    showToast("Capturing reference point…", 1_200)
-                })
-                CircleButton("☰", "Points", onClick = { showPointsList = true })
-                CircleButton("◳", "Objects", onClick = { showObjectsList = true })
+                CircleButton(
+                    glyph = "✕",
+                    description = "Exit camera: Closes the camera view and returns to the list (all captured points are kept).",
+                    onClick = onCancel,
+                    onLongPress = { showToast(it, 3_500) },
+                )
+                CircleButton(
+                    glyph = "⊕",
+                    description = "Start here: Sets your current standing spot as the starting origin point without scanning a sign.",
+                    onClick = { startWithoutSign() },
+                    onLongPress = { showToast(it, 3_500) },
+                )
+                CircleButton(
+                    glyph = "◎",
+                    description = "Add Reference Point: Captures a photo & 3D position of what the camera center is aimed at so the app can recognize this spot later.",
+                    onClick = {
+                        captureReq[0] = true
+                        showToast("Capturing reference point…", 1_200)
+                    },
+                    onLongPress = { showToast(it, 3_500) },
+                )
+                CircleButton(
+                    glyph = "☰",
+                    description = "Reference Points List: View, navigate to, add (+), or delete any saved reference points.",
+                    onClick = { showPointsList = true },
+                    onLongPress = { showToast(it, 3_500) },
+                )
+                CircleButton(
+                    glyph = "◳",
+                    description = "Placed Objects List: View, navigate to, or delete any 3D objects placed in the room.",
+                    onClick = { showObjectsList = true },
+                    onLongPress = { showToast(it, 3_500) },
+                )
+                if (onOpenSigns != null) {
+                    CircleButton(
+                        glyph = "🏷",
+                        description = "AR Signs Gallery: Add sign images from Camera/Gallery, share to print, or delete signs.",
+                        onClick = onOpenSigns,
+                        onLongPress = { showToast(it, 3_500) },
+                    )
+                }
                 Spacer(Modifier.weight(1f))
                 if (hasUserObjects) {
                     TextButton(onClick = {
@@ -1054,17 +1154,27 @@ fun WayFinderCaptureScreen(
                     }) { Text("Undo", color = Color.White) }
                 }
             }
-            Button(
-                enabled = true,
-                modifier = Modifier.fillMaxWidth(),
-                onClick = {
-                    pendingDestination = averageOf(recent) ?: Vec3(camera[0], camera[1], camera[2])
-                    pendingLevel = user.level.ifEmpty { defaultLevel }
-                    pendingFloorSession = floorSessionY()
-                    naming = true
-                },
+            @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Color(0xFF0A84FF))
+                    .combinedClickable(
+                        onClick = {
+                            pendingDestination = averageOf(recent) ?: Vec3(camera[0], camera[1], camera[2])
+                            pendingLevel = user.level.ifEmpty { defaultLevel }
+                            pendingFloorSession = floorSessionY()
+                            naming = true
+                        },
+                        onLongClick = {
+                            showToast("Save destination here: Saves your current spot, walked path, and placed objects as a named destination.", 3_500)
+                        },
+                    )
+                    .padding(vertical = 12.dp),
+                contentAlignment = Alignment.Center,
             ) {
-                Text("Save destination here")
+                Text("Save destination here", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
             }
         }
     }
@@ -1074,39 +1184,63 @@ fun WayFinderCaptureScreen(
             onDismissRequest = { showPointsList = false },
             title = { Text("Reference points (${allRefPins.size})") },
             text = {
-                if (allRefPins.isEmpty()) {
-                    Text("None yet. Tap ◎ to capture one.")
-                } else {
-                    Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
-                        allRefPins.forEach { p ->
-                            val dist = hypot(p.x - userVenuePos.x, p.z - userVenuePos.z)
-                            Text(
-                                "📍 ${p.name} (%.1f m)".format(dist),
-                                color = Color(0xFF0A84FF),
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.fillMaxWidth()
-                                    .clickable {
-                                        showPointsList = false
-                                        planToTarget(
-                                            AdminNavTarget(
-                                                id = "refpin-${p.name}",
-                                                label = p.name,
-                                                glyph = "📍",
-                                                subtitle = "Reference point",
-                                                level = defaultLevel,
-                                                x = p.x,
-                                                y = p.y,
-                                                z = p.z,
-                                            ),
-                                        )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (allRefPins.isEmpty()) {
+                        Text("None yet. Tap ◎ to capture one.")
+                    } else {
+                        Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                            allRefPins.forEach { p ->
+                                val dist = hypot(p.x - userVenuePos.x, p.z - userVenuePos.z)
+                                Row(
+                                    Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        "📍 ${p.name} (%.1f m)".format(dist),
+                                        color = Color(0xFF0A84FF),
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.weight(1f).clickable {
+                                            showPointsList = false
+                                            planToTarget(
+                                                AdminNavTarget(
+                                                    id = "refpin-${p.name}",
+                                                    label = p.name,
+                                                    glyph = "📍",
+                                                    subtitle = "Reference point",
+                                                    level = defaultLevel,
+                                                    x = p.x,
+                                                    y = p.y,
+                                                    z = p.z,
+                                                ),
+                                            )
+                                        },
+                                    )
+                                    TextButton(
+                                        onClick = {
+                                            if (p.id.isNotEmpty()) deletedRefIds.add(p.id)
+                                            deletedRefNames.add(p.name)
+                                            sessionRefPins.removeAll { it.name == p.name }
+                                            onDeleteReferencePoint(p.id, p.name)
+                                            showToast("Deleted reference point “${p.name}”", 2_000)
+                                        },
+                                    ) {
+                                        Text("Delete", color = Color(0xFFFF3B30))
                                     }
-                                    .padding(vertical = 12.dp),
-                            )
+                                }
+                            }
                         }
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { showPointsList = false }) { Text("Close") } },
+            confirmButton = {
+                TextButton(onClick = {
+                    showPointsList = false
+                    captureReq[0] = true
+                    showToast("Capturing reference point…", 1_200)
+                }) { Text("＋ Add point") }
+            },
+            dismissButton = { TextButton(onClick = { showPointsList = false }) { Text("Close") } },
         )
     }
 
@@ -1123,10 +1257,14 @@ fun WayFinderCaptureScreen(
                     Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
                         items.forEach { (obj, inVenue) ->
                             val label = if (obj.text.isNotBlank()) obj.text else obj.kind.label
-                            Text(
-                                "${obj.kind.glyph} $label",
-                                modifier = Modifier.fillMaxWidth()
-                                    .clickable {
+                            Row(
+                                Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "${obj.kind.glyph} $label",
+                                    modifier = Modifier.weight(1f).clickable {
                                         showObjectsList = false
                                         val vPos = if (inVenue) obj.position else filter.alignment.inverse().transformPoint(obj.position)
                                         planToTarget(
@@ -1141,9 +1279,21 @@ fun WayFinderCaptureScreen(
                                                 z = vPos.z,
                                             ),
                                         )
-                                    }
-                                    .padding(vertical = 12.dp),
-                            )
+                                    },
+                                )
+                                TextButton(
+                                    onClick = {
+                                        sessionObjects.removeAll { it.id == obj.id }
+                                        committedObjects.removeAll { it.id == obj.id }
+                                        anchors.remove(obj.id)?.detach()
+                                        deletedObjectIds.add(obj.id)
+                                        onDeleteObject(obj.id)
+                                        showToast("Deleted $label", 2_000)
+                                    },
+                                ) {
+                                    Text("Delete", color = Color(0xFFFF3B30))
+                                }
+                            }
                         }
                     }
                 }
@@ -1211,6 +1361,9 @@ fun WayFinderCaptureScreen(
 
     pendingRef?.let { ref ->
         var refName by remember(ref) { mutableStateOf("") }
+        val ratio = remember(ref.image) {
+            (ref.image.width.toFloat() / ref.image.height.toFloat().coerceAtLeast(1f)).coerceIn(0.4f, 2.5f)
+        }
         val quality = when {
             !ref.accepted -> "Low contrast — will still save as reference pin"
             ref.detail >= 55 -> "Good detail — trackable"
@@ -1220,26 +1373,37 @@ fun WayFinderCaptureScreen(
             onDismissRequest = { pendingRef = null },
             title = { Text("Save reference point") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Image(
-                        bitmap = ref.image.asImageBitmap(),
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxWidth().height(160.dp).clip(RoundedCornerShape(10.dp)),
-                    )
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Image(
+                            bitmap = ref.image.asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .heightIn(max = 180.dp)
+                                .aspectRatio(ratio)
+                                .clip(RoundedCornerShape(10.dp)),
+                        )
+                    }
                     Text(quality, fontWeight = FontWeight.Bold)
                     Text("Quality ${ref.detail}/100 · about %.1f m away".format(ref.distanceM))
                     OutlinedTextField(
-                        value = refName, onValueChange = { refName = it }, singleLine = true,
+                        value = refName,
+                        onValueChange = { refName = it },
+                        singleLine = true,
                         label = { Text("Name, e.g. Lobby poster") },
+                        modifier = Modifier.fillMaxWidth(),
                     )
                 }
             },
             confirmButton = {
                 TextButton(
-                    enabled = refName.isNotBlank(),
+                    enabled = true,
                     onClick = {
-                        val trimmed = refName.trim()
+                        val trimmed = refName.trim().ifEmpty { "Ref point ${allRefPins.size + 1}" }
                         onSaveReferencePoint(
                             CapturedReferencePoint(
                                 name = trimmed, image = ref.image, physicalWidth = ref.physicalWidth,
@@ -1257,11 +1421,42 @@ fun WayFinderCaptureScreen(
             dismissButton = { TextButton(onClick = { pendingRef = null }) { Text("Retake") } },
         )
     }
+
+    if (showHelpGuide) {
+        AlertDialog(
+            onDismissRequest = { showHelpGuide = false },
+            title = { Text("Admin Camera Button Guide") },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("Tip: You can also long-press any button on the camera screen to see what it does!", fontSize = 13.sp, color = Color(0xFF0A84FF), fontWeight = FontWeight.SemiBold)
+                    Text("• 📍 You are currently at + Dropdown:\nShows your current reference point. Tap 'Navigate to' dropdown to see live 3D floor arrows to any destination, reference point, or placed object.")
+                    Text("• Auto points (Switch):\nWhen ON, automatically captures a reference point every 3 meters as you walk.")
+                    Text("• ☕ Mug / 🎁 Gift / ⭐ Star / 🎈 Balloon / 💬 Message:\nSelect an object on the bar, then tap anywhere on the live camera video to place it in 3D.")
+                    Text("• ✕ (Exit Camera):\nCloses the camera and goes back to the list. All saved points & destinations are kept.")
+                    Text("• ⊕ (Start Here):\nSets your current standing position as the starting origin without needing to scan a sign.")
+                    Text("• ◎ (Add Reference Point):\nCaptures a photo & 3D position of what the center of the camera is aimed at, placing a blue 3D pin and registering it for recognition.")
+                    Text("• ☰ (Reference Points List):\nLists all reference points with distance. Tap one to navigate to it, tap 'Delete' to remove it, or tap '+ Add point'.")
+                    Text("• ◳ (Objects List):\nLists all placed 3D objects. Tap one to navigate to it, or tap 'Delete' to remove it.")
+                    Text("• 🏷 (AR Signs):\nOpens the AR Signs gallery to add a sign from Camera/Gallery, share to print, or delete signs.")
+                    Text("• Save destination here:\nSaves your current position, walked path, and placed objects as a named destination while staying in the camera view.")
+                }
+            },
+            confirmButton = { TextButton(onClick = { showHelpGuide = false }) { Text("Got it") } },
+        )
+    }
 }
 
-/** The bar of objects a tap can place; the selected one is highlighted. */
+/** The bar of objects a tap can place; the selected one is highlighted. Long-pressing shows what it does. */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun ObjectBar(selected: PlacedObjectKind, onSelect: (PlacedObjectKind) -> Unit) {
+private fun ObjectBar(
+    selected: PlacedObjectKind,
+    onSelect: (PlacedObjectKind) -> Unit,
+    onLongPress: (PlacedObjectKind) -> Unit = {},
+) {
     Row(
         Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1275,7 +1470,10 @@ private fun ObjectBar(selected: PlacedObjectKind, onSelect: (PlacedObjectKind) -
                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                 modifier = Modifier
                     .background(if (isSelected) Color(0xFFFFFFFF) else Color(0x99000000), RoundedCornerShape(20.dp))
-                    .clickable { onSelect(kind) }
+                    .combinedClickable(
+                        onClick = { onSelect(kind) },
+                        onLongClick = { onLongPress(kind) },
+                    )
                     .padding(horizontal = 14.dp, vertical = 9.dp),
             )
         }

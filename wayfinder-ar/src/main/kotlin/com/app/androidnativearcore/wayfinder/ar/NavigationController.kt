@@ -142,10 +142,11 @@ class NavigationController(
         if (languages == null) text.resolved() else text.resolved(languages)
 
     init {
-        showAlignmentPrompt(
-            if (recordedFromMarkerId.isNotEmpty()) recordedSignPrompt()
-            else "Look for a sign like these near entrances, elevators and escalators. Hold the phone so the whole sign is visible.",
-        )
+        // Bootstrap alignment immediately so directions arrows render right away even before scanning a sign;
+        // scanning any reference point or AR sign will still refine/re-align the session.
+        isAligned = true
+        currentLevel = destination.level
+        needsRoute = true
     }
 
     private fun recordedSignPrompt(): String {
@@ -261,7 +262,11 @@ class NavigationController(
         val position = cameraInVenue.translation
         val forward = -cameraInVenue.column(2)
         lastPosition = position
-        val level = venue.level(forDeviceHeight = position.y)?.id ?: currentLevel ?: destination.level
+        val level = if (destination.followsWalkedPaths && destination.level.isNotEmpty()) {
+            destination.level
+        } else {
+            venue.level(forDeviceHeight = position.y)?.id ?: currentLevel ?: destination.level
+        }
         currentLevel = level
         uiState = uiState.copy(user = UserPose(position, forward))
 
@@ -327,12 +332,13 @@ class NavigationController(
             } else {
                 planner.route(position, level, toPOI = destination.id, profile = profile)
             }
+            val renderedLvl = route.levels.firstOrNull() ?: level
             tracker = NavigationTracker(route).also {
                 // A destination the user saved is where they stood, measured to centimeters; 2 m is several steps early.
                 it.arrivalRadius = if (destination.followsWalkedPaths) CUSTOM_ARRIVAL_RADIUS_M else 2f
             }
             arrivedSince = null
-            uiState = uiState.copy(route = route, renderedLevel = level, banner = uiState.banner ?: placeholderBanner())
+            uiState = uiState.copy(route = route, renderedLevel = renderedLvl, banner = uiState.banner ?: placeholderBanner())
             listener?.onRoutePlanned(route, rerouted)
         } catch (e: Exception) {
             uiState = uiState.copy(banner = GuidanceBanner("No route found", "⚠", e.message ?: "No route found."))
@@ -341,19 +347,36 @@ class NavigationController(
 
     /** Routes along the walked path (port of the iOS prototype's `WalkedPathController.planRoute`). */
     private fun planWalkedRoute(position: Vec3, level: String): Route {
-        if (destination.level != level) {
-            val where = venue.level(destination.level)?.let { resolve(it.name) } ?: destination.level
-            throw RoutingError.Other("This destination was saved on $where. Go there first.")
-        }
-        val floor = destination.elevation ?: venue.level(level)?.elevation ?: 0f
+        val targetLevel = destination.level.ifEmpty { level }
+        val floor = destination.elevation ?: venue.level(targetLevel)?.elevation ?: (position.y - 1.4f)
         val start = Vec3(position.x, floor, position.z)
         val goal = Vec3(destination.x, floor, destination.z)
-        val points = walkedPoints.filter { it.level == level }
-        return when (val result = WalkedPathRouter(startJoinDistance = 5f, destinationJoinDistance = 4f).route(start, goal, points)) {
-            is WalkedRouteResult.Success -> planner.routeAlong(result.points, level, profile)
+        val points = walkedPoints.filter { it.level == targetLevel }.ifEmpty { walkedPoints }
+        val router = WalkedPathRouter(startJoinDistance = 12f, destinationJoinDistance = 12f)
+        return when (val result = router.route(start, goal, points)) {
+            is WalkedRouteResult.Success -> planner.routeAlong(result.points, targetLevel, profile)
             is WalkedRouteResult.Failure -> {
-                val direct = com.app.androidnativearcore.wayfinder.core.straightWalk(start, goal, "direct", level, floor).map { it.position } + goal
-                planner.routeAlong(direct, level, profile)
+                // If there are recorded path points leading to this destination, follow them from the closest point!
+                val matchingRun = points.filter { it.destinationId == destination.id }.sortedBy { it.sequence }
+                    .ifEmpty {
+                        // Or find the run whose end is closest to the goal
+                        points.groupBy { it.run }.values
+                            .map { run -> run.sortedBy { it.sequence } }
+                            .minByOrNull { run -> run.last().position.distanceTo(goal) }
+                            ?.takeIf { run -> run.last().position.distanceTo(goal) <= 5f }
+                            .orEmpty()
+                    }
+                if (matchingRun.size >= 2) {
+                    val closestIdx = matchingRun.indices.minByOrNull { matchingRun[it].position.distanceTo(start) } ?: 0
+                    val lead = com.app.androidnativearcore.wayfinder.core.straightWalk(
+                        start, matchingRun[closestIdx].position, "lead", targetLevel, floor,
+                    ).map { it.position }
+                    val tail = matchingRun.drop(closestIdx).map { Vec3(it.x, floor, it.z) } + goal
+                    planner.routeAlong((lead + tail).distinct(), targetLevel, profile)
+                } else {
+                    val direct = com.app.androidnativearcore.wayfinder.core.straightWalk(start, goal, "direct", targetLevel, floor).map { it.position } + goal
+                    planner.routeAlong(direct, targetLevel, profile)
+                }
             }
         }
     }
