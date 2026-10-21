@@ -236,6 +236,21 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     markerStore.delete(id)
                     extraMarkers = markerStore.load(basePackage.venue.id)
                 }) else null,
+                onAddSign = if (mode == AppMode.ADMIN) ({ name, width, bmp ->
+                    val id = "ref-" + UUID.randomUUID()
+                    val imageFile = markerStore.imageFile(id)
+                    imageFile.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    markerStore.save(
+                        basePackage.venue.id,
+                        Venue.Marker(
+                            id = id, name = LocalizedText(name), image = imageFile.absolutePath,
+                            physicalWidth = width,
+                            level = basePackage.venue.levels.firstOrNull()?.id ?: "",
+                            x = 0f, y = 1.4f, z = 0f, facing = 0f, mounting = Venue.MarkerMounting.WALL,
+                        ),
+                    )
+                    extraMarkers = markerStore.load(basePackage.venue.id)
+                }) else null,
             )
         }
         is Screen.Navigate -> {
@@ -537,9 +552,32 @@ private fun POIRow(poi: Venue.POI, onClick: () -> Unit, onLongClick: (() -> Unit
 
 /** Shows the venue's AR signs with where they belong, and lets testers share an image to print. */
 @Composable
-private fun MarkerGalleryScreen(pkg: VenuePackage, onBack: () -> Unit, onDeleteMarker: ((String) -> Unit)? = null) {
+private fun MarkerGalleryScreen(
+    pkg: VenuePackage,
+    onBack: () -> Unit,
+    onDeleteMarker: ((String) -> Unit)? = null,
+    onAddSign: ((name: String, widthMeters: Float, image: Bitmap) -> Unit)? = null,
+) {
     val context = LocalContext.current
-    Scaffold { padding ->
+    var picked by remember { mutableStateOf<Bitmap?>(null) }
+    val pickLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            picked = runCatching {
+                context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+            }.getOrNull()
+        }
+    }
+    Scaffold(
+        floatingActionButton = {
+            if (onAddSign != null) {
+                ExtendedFloatingActionButton(
+                    text = { Text("Add sign") },
+                    icon = { Text("＋") },
+                    onClick = { pickLauncher.launch("image/*") },
+                )
+            }
+        },
+    ) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding).statusBarsPadding()) {
             item {
                 Row(Modifier.padding(start = 8.dp, end = 16.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -577,6 +615,38 @@ private fun MarkerGalleryScreen(pkg: VenuePackage, onBack: () -> Unit, onDeleteM
                 }
             }
         }
+    }
+
+    picked?.let { bitmap ->
+        var name by remember(bitmap) { mutableStateOf("") }
+        var widthCm by remember(bitmap) { mutableStateOf("20") }
+        AlertDialog(
+            onDismissRequest = { picked = null },
+            title = { Text("Add AR sign") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
+                    )
+                    OutlinedTextField(value = name, onValueChange = { name = it }, singleLine = true, label = { Text("Name") })
+                    OutlinedTextField(
+                        value = widthCm, onValueChange = { widthCm = it.filter(Char::isDigit).take(4) },
+                        singleLine = true, label = { Text("Printed width (cm)") },
+                    )
+                    Text("Position isn't set — scan this sign in capture to place it accurately.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+            confirmButton = {
+                val cm = widthCm.toFloatOrNull() ?: 0f
+                TextButton(
+                    enabled = name.isNotBlank() && cm > 0f && onAddSign != null,
+                    onClick = { onAddSign?.invoke(name.trim(), cm / 100f, bitmap); picked = null },
+                ) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { picked = null }) { Text("Cancel") } },
+        )
     }
 }
 
