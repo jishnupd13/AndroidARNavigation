@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -171,6 +172,12 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     markerStore.clear()
                     extraMarkers = markerStore.load(basePackage.venue.id)
                 },
+                onOpenCamera = {
+                    // Direct camera for visitors: jump into AR without picking from the list first.
+                    pkg.venue.pois.firstOrNull()?.let {
+                        screen = Screen.Navigate(it, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST)
+                    }
+                },
             )
         }
         Screen.Capture -> WayFinderCaptureScreen(
@@ -278,6 +285,7 @@ private fun DestinationListScreen(
     onRenameDestination: (Venue.POI, String) -> Unit = { _, _ -> },
     onDataChanged: () -> Unit = {},
     onClearMarkers: () -> Unit = {},
+    onOpenCamera: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val venue = pkg.venue
@@ -318,7 +326,17 @@ private fun DestinationListScreen(
         }
     }
 
-    Scaffold { padding ->
+    Scaffold(
+        floatingActionButton = {
+            if (!admin && venue.pois.isNotEmpty()) {
+                ExtendedFloatingActionButton(
+                    text = { Text("Camera") },
+                    icon = { Text("📷") },
+                    onClick = onOpenCamera,
+                )
+            }
+        },
+    ) { padding ->
         LazyColumn(
             Modifier.fillMaxSize().padding(padding).statusBarsPadding(),
             verticalArrangement = Arrangement.spacedBy(8.dp),
