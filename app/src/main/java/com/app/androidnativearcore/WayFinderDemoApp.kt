@@ -393,6 +393,7 @@ private fun DestinationListScreen(
     val venue = pkg.venue
     val admin = mode == AppMode.ADMIN
     val refMarkers = remember(venue.markers) { venue.markers.filter { it.id.startsWith("ref-") } }
+    val customPois = remember(venue.pois) { venue.pois.filter { it.category == CustomDestination.CATEGORY } }
     val userObjects = remember(placedObjects) { placedObjects.filter { !it.isReference } }
     val capturedCount = refMarkers.size
     var search by remember { mutableStateOf("") }
@@ -500,9 +501,9 @@ private fun DestinationListScreen(
                         )
                     }
                 }
-                if (refMarkers.isNotEmpty() || userObjects.isNotEmpty()) {
+                if (refMarkers.isNotEmpty() || customPois.isNotEmpty() || userObjects.isNotEmpty()) {
                     item {
-                        IosSection(title = "Reference points & objects (walk & connect)") {
+                        IosSection(title = "Reference points, destinations & objects (walk & connect)") {
                             val fromMarker = refMarkers.firstOrNull { it.id == selectedFromRefId } ?: refMarkers.firstOrNull()
                             val fromLabel = fromMarker?.name?.resolved() ?: "Start point"
                             refMarkers.forEachIndexed { idx, marker ->
@@ -516,14 +517,25 @@ private fun DestinationListScreen(
                                         "Tap to walk & connect from 📍 $fromLabel → 📍 ${marker.name.resolved()}"
                                     },
                                     onClick = {
-                                        if (isStart && refMarkers.size + userObjects.size > 1) {
+                                        if (isStart && refMarkers.size + customPois.size + userObjects.size > 1) {
                                             showConnectDialog = true
                                         } else {
                                             onWalkAndConnect(fromMarker?.id, marker.id)
                                         }
                                     },
                                 )
-                                if (idx < refMarkers.lastIndex || userObjects.isNotEmpty()) IosRowDivider()
+                                if (idx < refMarkers.lastIndex || customPois.isNotEmpty() || userObjects.isNotEmpty()) IosRowDivider()
+                            }
+                            customPois.forEachIndexed { idx, poi ->
+                                IosRow(
+                                    title = "⭐ ${poi.name.resolved()}",
+                                    glyph = "🔗",
+                                    subtitle = "Tap to walk & connect from 📍 $fromLabel → ⭐ ${poi.name.resolved()}",
+                                    onClick = {
+                                        onWalkAndConnect(fromMarker?.id, poi.id)
+                                    },
+                                )
+                                if (idx < customPois.lastIndex || userObjects.isNotEmpty()) IosRowDivider()
                             }
                             userObjects.forEachIndexed { idx, obj ->
                                 val label = obj.text.ifBlank { obj.kind.label }
@@ -665,14 +677,14 @@ private fun DestinationListScreen(
                     }
 
                     Text(
-                        "2. Tap Target Reference Point or Object to Walk & Connect To:",
+                        "2. Tap Target Destination, Reference Point, or Object to Walk & Connect To:",
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp,
                         modifier = Modifier.padding(top = 4.dp),
                     )
                     val fromName = refMarkers.firstOrNull { it.id == selectedFromRefId }?.name?.resolved() ?: "Start point"
                     val targetRefs = refMarkers.filter { it.id != selectedFromRefId || refMarkers.size == 1 }
-                    if (targetRefs.isEmpty() && userObjects.isEmpty()) {
+                    if (targetRefs.isEmpty() && customPois.isEmpty() && userObjects.isEmpty()) {
                         Text(
                             "Tap 'Open Camera' below to capture more reference points or place 3D objects and connect them.",
                             fontSize = 12.sp,
@@ -701,6 +713,35 @@ private fun DestinationListScreen(
                                     )
                                     Text(
                                         "Walk from 📍 $fromName → 📍 ${target.name.resolved()}",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                        customPois.forEach { poi ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0x1834C759))
+                                    .clickable {
+                                        showConnectDialog = false
+                                        onWalkAndConnect(selectedFromRefId, poi.id)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "⭐ ${poi.name.resolved()}",
+                                        color = Color(0xFFFF9500),
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "Walk from 📍 $fromName → ⭐ ${poi.name.resolved()}",
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
@@ -745,6 +786,7 @@ private fun DestinationListScreen(
                     onClick = {
                         showConnectDialog = false
                         val defaultTarget = refMarkers.firstOrNull { it.id != selectedFromRefId }?.id
+                            ?: customPois.firstOrNull()?.id
                             ?: userObjects.firstOrNull()?.id
                         onWalkAndConnect(selectedFromRefId, defaultTarget)
                     },

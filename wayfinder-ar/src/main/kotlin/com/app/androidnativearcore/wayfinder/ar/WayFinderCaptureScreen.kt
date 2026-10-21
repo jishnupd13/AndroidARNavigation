@@ -335,6 +335,8 @@ fun WayFinderCaptureScreen(
     var showPointsList by remember { mutableStateOf(false) }
     var showObjectsList by remember { mutableStateOf(false) }
     var showHelpGuide by remember { mutableStateOf(false) }
+    var show2DMapDialog by remember { mutableStateOf(false) }
+    var showConnectPickerDialog by remember { mutableStateOf(false) }
     var unusableRefsWarning by remember { mutableStateOf<String?>(null) }
 
     // --- Live "Currently at" & Dropdown Navigation state ---
@@ -1122,7 +1124,8 @@ fun WayFinderCaptureScreen(
                                     startWithoutSign()
                                 },
                             )
-                            if (allRefPins.isEmpty()) {
+                            val customPois = (venue.pois + sessionSavedDestinations).filter { it.category == CustomDestination.CATEGORY }
+                            if (allRefPins.isEmpty() && customPois.isEmpty()) {
                                 DropdownMenuItem(
                                     text = { Text("No saved reference points yet — tap ◎ to capture one", color = Color.Gray) },
                                     onClick = { fromDropdownExpanded = false },
@@ -1140,6 +1143,23 @@ fun WayFinderCaptureScreen(
                                         onClick = {
                                             fromDropdownExpanded = false
                                             selectStartReferencePoint(pin)
+                                        },
+                                    )
+                                }
+                                customPois.forEach { poi ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                "⭐ Start from: ${poi.name.resolved()}",
+                                                color = Color(0xFFFF9500),
+                                                fontWeight = FontWeight.SemiBold,
+                                            )
+                                        },
+                                        onClick = {
+                                            fromDropdownExpanded = false
+                                            selectStartReferencePoint(
+                                                RefPin(poi.x, poi.elevation ?: PHONE_HEIGHT_M, poi.z, poi.name.resolved(), poi.id),
+                                            )
                                         },
                                     )
                                 }
@@ -1348,6 +1368,12 @@ fun WayFinderCaptureScreen(
                     onClick = { showObjectsList = true },
                     onLongPress = { showToast(it, 3_500) },
                 )
+                CircleButton(
+                    glyph = "🗺",
+                    description = "2D Floor Map: Opens a 2D map dialog displaying all reference points, destinations, 3D objects, and walked paths.",
+                    onClick = { show2DMapDialog = true },
+                    onLongPress = { showToast(it, 3_500) },
+                )
                 if (onOpenSigns != null) {
                     CircleButton(
                         glyph = "🏷",
@@ -1371,18 +1397,29 @@ fun WayFinderCaptureScreen(
                     }) { Text("Undo", color = Color.White) }
                 }
             }
-            selectedNavTarget?.let { target ->
-                @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+            @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val target = selectedNavTarget
                 Box(
                     Modifier
-                        .fillMaxWidth()
+                        .weight(1f)
                         .clip(RoundedCornerShape(24.dp))
                         .background(Color(0xFF34C759))
                         .combinedClickable(
-                            onClick = { connectWalkedPathTo(target) },
+                            onClick = {
+                                if (target != null) {
+                                    connectWalkedPathTo(target)
+                                } else {
+                                    showConnectPickerDialog = true
+                                }
+                            },
                             onLongClick = {
                                 showToast(
-                                    "Connect walked path: Saves the walked path connecting 📍 $currentAtName to ${target.glyph} ${target.label} so navigation routes between them.",
+                                    "Connect walked path: Once you start at a reference point/destination and walk to another destination, reference point, or object, tap this to link them with your walked path!",
                                     3_500,
                                 )
                             },
@@ -1391,11 +1428,27 @@ fun WayFinderCaptureScreen(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        "🔗 Connect walked path: $currentAtName → ${target.label}",
+                        if (target != null) {
+                            "🔗 Connect: $currentAtName → ${target.label}"
+                        } else {
+                            "🔗 Connect $currentAtName → Destination / Ref / Object…"
+                        },
                         color = Color.White,
                         fontWeight = FontWeight.Bold,
                         fontSize = 14.sp,
                     )
+                }
+                if (target != null) {
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0xFF2C2C2E))
+                            .clickable { showConnectPickerDialog = true }
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("Pick ▾", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    }
                 }
             }
             @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
@@ -1421,6 +1474,98 @@ fun WayFinderCaptureScreen(
                 Text("Save destination here", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
             }
         }
+    }
+
+    if (showConnectPickerDialog) {
+        AlertDialog(
+            onDismissRequest = { showConnectPickerDialog = false },
+            title = { Text("🔗 Connect walked path from “$currentAtName”") },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "Tap the Destination, Reference Point, or Object you reached to connect your walked path from “$currentAtName” to it:",
+                        fontSize = 12.sp,
+                        color = Color.Gray,
+                    )
+                    if (navTargets.isEmpty()) {
+                        Text("No saved destinations, reference points, or objects yet.")
+                    } else {
+                        navTargets.forEach { t ->
+                            val dist = hypot(t.x - userVenuePos.x, t.z - userVenuePos.z)
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Color(0x1834C759))
+                                    .clickable {
+                                        showConnectPickerDialog = false
+                                        selectedNavTarget = t
+                                        connectWalkedPathTo(t)
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "${t.glyph} ${t.label}",
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (t.glyph == "📍") Color(0xFF0A84FF) else Color.Unspecified,
+                                    )
+                                    Text("${t.subtitle} · %.1f m away".format(dist), fontSize = 12.sp, color = Color.Gray)
+                                }
+                                Text("🔗 Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showConnectPickerDialog = false }) { Text("Close") }
+            },
+        )
+    }
+
+    if (show2DMapDialog) {
+        val venueFromSession = filter.alignment.inverse()
+        val liveWalkInVenue = recorder.points.map { venueFromSession.transformPoint(it.position) }
+        val sessionObjsInVenue = sessionObjects.filter { !it.isReference }.map { obj ->
+            val v = venueFromSession.transformPoint(obj.position)
+            obj.copy(x = v.x, y = v.y, z = v.z, level = defaultLevel)
+        }
+        val allPoisForMap = (venue.pois + sessionSavedDestinations).filter { it.category != REFERENCE_CATEGORY }
+        Live2DMapDialog(
+            walkedPoints = existingWalkedPoints + sessionConnectedWalkedPoints + committedPath,
+            liveWalkPoints = liveWalkInVenue,
+            refPins = allRefPins,
+            destinations = allPoisForMap,
+            objects = allVenueObjects + sessionObjsInVenue,
+            userPos = userVenuePos,
+            activeRoutePoints = activeRoute?.points.orEmpty(),
+            currentFromName = currentAtName,
+            onDismiss = { show2DMapDialog = false },
+            onSelectNavigate = { item ->
+                navTargets.firstOrNull { it.id == item.id || it.label == item.label }?.let { planToTarget(it) }
+            },
+            onSelectConnect = { item ->
+                val found = navTargets.firstOrNull { it.id == item.id || it.label == item.label }
+                    ?: AdminNavTarget(
+                        id = item.id,
+                        label = item.label,
+                        glyph = item.glyph,
+                        subtitle = item.kindLabel,
+                        level = defaultLevel,
+                        x = item.x,
+                        y = item.y,
+                        z = item.z,
+                    )
+                selectedNavTarget = found
+                connectWalkedPathTo(found)
+            },
+        )
     }
 
     if (showPointsList) {

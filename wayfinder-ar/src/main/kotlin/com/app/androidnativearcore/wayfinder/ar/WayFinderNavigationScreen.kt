@@ -39,6 +39,7 @@ import com.app.androidnativearcore.wayfinder.core.Mat4
 import com.app.androidnativearcore.wayfinder.core.PlacedObject
 import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
+import com.app.androidnativearcore.wayfinder.core.Vec3
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
 import com.app.androidnativearcore.wayfinder.core.WalkedPoint
@@ -109,6 +110,7 @@ fun WayFinderNavigationScreen(
     }
     var showFeedback by remember { mutableStateOf(false) }
     var showNavHelp by remember { mutableStateOf(false) }
+    var show2DMapDialog by remember { mutableStateOf(false) }
     var dropdownExpanded by remember { mutableStateOf(false) }
 
     // Reference points to render in blue in the live camera video
@@ -346,6 +348,12 @@ fun WayFinderNavigationScreen(
                 onLongPress = { controller.showToast(it, 3_500) },
             )
             CircleButton(
+                glyph = "🗺",
+                description = "2D Floor Map: Opens a 2D map dialog displaying all reference points, destinations, 3D objects, and walked paths",
+                onClick = { show2DMapDialog = true },
+                onLongPress = { controller.showToast(it, 3_500) },
+            )
+            CircleButton(
                 glyph = "!",
                 description = "Report a problem: Report a blocked route, missing sign, or wrong directions",
                 onClick = { showFeedback = true },
@@ -369,6 +377,26 @@ fun WayFinderNavigationScreen(
 
         // Dismissing arrival keeps the user in the live camera view so they can pick another destination from the dropdown!
         state.arrival?.let { ArrivalOverlay(it, onDone = controller::dismissArrival) }
+    }
+
+    if (show2DMapDialog) {
+        val allPoisForMap = venue.pois.filter { it.category != REFERENCE_CATEGORY }
+        Live2DMapDialog(
+            walkedPoints = walkedPoints,
+            liveWalkPoints = emptyList(),
+            refPins = refPins,
+            destinations = allPoisForMap,
+            objects = placedObjects,
+            userPos = userPos ?: Vec3.ZERO,
+            activeRoutePoints = state.route?.points.orEmpty(),
+            currentFromName = currentAtName,
+            onDismiss = { show2DMapDialog = false },
+            onSelectNavigate = { item ->
+                availableTargets.firstOrNull {
+                    it.id == item.id || it.id == "objpoi-${item.id}" || it.name.resolved().contains(item.label, ignoreCase = true)
+                }?.let { controller.selectDestination(it) }
+            },
+        )
     }
 
     if (showFeedback) {
