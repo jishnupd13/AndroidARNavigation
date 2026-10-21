@@ -2,6 +2,7 @@ package com.app.androidnativearcore
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
 import androidx.activity.compose.BackHandler
@@ -46,6 +47,7 @@ import androidx.core.content.FileProvider
 import com.app.androidnativearcore.ui.designkit.IosRow
 import com.app.androidnativearcore.ui.designkit.IosRowDivider
 import com.app.androidnativearcore.ui.designkit.IosSection
+import com.app.androidnativearcore.wayfinder.ar.CapturedReferencePoint
 import com.app.androidnativearcore.wayfinder.ar.NavigationFeedback
 import com.app.androidnativearcore.wayfinder.ar.WayFinderCaptureScreen
 import com.app.androidnativearcore.wayfinder.ar.WayFinderNavigationListener
@@ -53,11 +55,14 @@ import com.app.androidnativearcore.wayfinder.ar.WayFinderNavigationScreen
 import com.app.androidnativearcore.wayfinder.core.CustomDestination
 import com.app.androidnativearcore.wayfinder.core.ArPath
 import com.app.androidnativearcore.wayfinder.core.ArPathStore
+import com.app.androidnativearcore.wayfinder.core.CapturedMarkerStore
+import com.app.androidnativearcore.wayfinder.core.LocalizedText
 import com.app.androidnativearcore.wayfinder.core.Route
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
 import com.app.androidnativearcore.wayfinder.core.withCustomDestinations
+import com.app.androidnativearcore.wayfinder.core.withExtraMarkers
 import com.google.ar.core.ArCoreApk
 import java.io.File
 import java.util.UUID
@@ -116,10 +121,16 @@ private fun WayFinderHost(basePackage: VenuePackage) {
     // Every path the user recorded is its own JSON file in `paths/`: the destination, the walk to it and the objects
     // along it. Destinations show up in the list as ordinary POIs.
     val store = remember { ArPathStore(File(context.filesDir, "paths")) }
+    // Reference points the admin captured are kept separately so they survive the bundled venue being re-copied from
+    // assets, then merged back in as ordinary markers.
+    val markerStore = remember { CapturedMarkerStore(File(context.filesDir, "captured-markers")) }
     var paths by remember { mutableStateOf(store.load(basePackage.venue.id)) }
+    var extraMarkers by remember { mutableStateOf(markerStore.load(basePackage.venue.id)) }
     val customDestinations = paths.map { it.destination }
-    val pkg = remember(basePackage, customDestinations) {
-        basePackage.withVenue(basePackage.venue.withCustomDestinations(customDestinations))
+    val pkg = remember(basePackage, customDestinations, extraMarkers) {
+        basePackage.withVenue(
+            basePackage.venue.withCustomDestinations(customDestinations).withExtraMarkers(extraMarkers),
+        )
     }
     var mode by remember { mutableStateOf(AppMode.USER) }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
@@ -163,9 +174,33 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     ),
                 )
                 paths = store.load(basePackage.venue.id)
+                extraMarkers = markerStore.load(basePackage.venue.id)
                 screen = Screen.List
             },
-            onCancel = { screen = Screen.List },
+            onCancel = {
+                // Reference points captured during this session are kept even if no destination was saved.
+                extraMarkers = markerStore.load(basePackage.venue.id)
+                screen = Screen.List
+            },
+            onSaveReferencePoint = { ref ->
+                val id = "ref-" + UUID.randomUUID()
+                val imageFile = markerStore.imageFile(id)
+                imageFile.outputStream().use { ref.image.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                markerStore.save(
+                    basePackage.venue.id,
+                    Venue.Marker(
+                        id = id,
+                        name = LocalizedText(ref.name),
+                        image = imageFile.absolutePath,
+                        physicalWidth = ref.physicalWidth,
+                        level = ref.level,
+                        x = ref.x, y = ref.y, z = ref.z,
+                        facing = ref.facing,
+                        mounting = ref.mounting,
+                    ),
+                )
+                // Don't refresh `extraMarkers` now: it would rebuild the AR session mid-capture. It reloads on exit.
+            },
         )
         Screen.Signs -> {
             BackHandler { screen = Screen.List }
