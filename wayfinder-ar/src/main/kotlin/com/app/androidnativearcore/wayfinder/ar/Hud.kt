@@ -1,9 +1,11 @@
 package com.app.androidnativearcore.wayfinder.ar
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -210,15 +212,59 @@ fun ArrivalOverlay(info: ArrivalInfo, onDone: () -> Unit, modifier: Modifier = M
     }
 }
 
-/** A round translucent button with a text glyph. */
+/**
+ * A round translucent button with a text glyph.
+ * Long-pressing shows a tooltip popup explaining what the button does (and optionally triggers [onLongPress]).
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun CircleButton(glyph: String, description: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    androidx.compose.foundation.layout.Box(
-        modifier
-            .size(44.dp)
-            .background(Color(0x8C000000), CircleShape)
-            .semantics { contentDescription = description }
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) { Text(glyph, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+fun CircleButton(
+    glyph: String,
+    description: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    onLongPress: ((String) -> Unit)? = null,
+) {
+    val showTip = remember { androidx.compose.runtime.mutableStateOf(false) }
+    LaunchedEffect(showTip.value) {
+        if (showTip.value) {
+            delay(2_500)
+            showTip.value = false
+        }
+    }
+    androidx.compose.foundation.layout.Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        androidx.compose.foundation.layout.Box(
+            Modifier
+                .size(44.dp)
+                .background(Color(0x8C000000), CircleShape)
+                .semantics { contentDescription = description }
+                .combinedClickable(
+                    onClick = onClick,
+                    onLongClick = {
+                        showTip.value = true
+                        onLongPress?.invoke(description)
+                    },
+                ),
+            contentAlignment = Alignment.Center,
+        ) { Text(glyph, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+
+        if (showTip.value) {
+            androidx.compose.ui.window.Popup(
+                alignment = Alignment.TopCenter,
+                offset = androidx.compose.ui.unit.IntOffset(0, -110),
+                onDismissRequest = { showTip.value = false },
+            ) {
+                Text(
+                    "$glyph  $description",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .background(Color(0xEE1C1C1E), RoundedCornerShape(10.dp))
+                        .border(1.dp, Color(0xFF0A84FF), RoundedCornerShape(10.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                )
+            }
+        }
+    }
 }

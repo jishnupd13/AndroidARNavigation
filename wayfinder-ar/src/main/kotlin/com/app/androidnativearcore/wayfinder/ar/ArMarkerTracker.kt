@@ -42,12 +42,16 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
     private val markersByID = pkg.venue.markers.associateBy { it.id }
     private val lastReportedMs = HashMap<String, Long>()
 
+    /** Markers successfully added to the ARCore AugmentedImageDatabase. */
+    val usableMarkers = mutableListOf<Venue.Marker>()
+
     /** Markers whose image ARCore rejected (too few features); the others still work. */
     val unusableMarkers = mutableListOf<Pair<Venue.Marker, String>>()
 
     /** Call from the session configuration callback, before the session resumes. */
     fun configure(session: Session, config: Config, aiming: Boolean = false) {
         val database = AugmentedImageDatabase(session)
+        usableMarkers.clear()
         unusableMarkers.clear()
         for (marker in pkg.venue.markers) {
             val bitmap = BitmapFactory.decodeFile(pkg.file(marker).path)
@@ -57,6 +61,7 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
             }
             try {
                 database.addImage(marker.id, bitmap, marker.physicalWidth)
+                usableMarkers += marker
             } catch (e: Exception) {
                 unusableMarkers += marker to (e.message ?: e.javaClass.simpleName)
             }
@@ -146,11 +151,28 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
             if (plane.type != Plane.Type.HORIZONTAL_UPWARD_FACING) continue
             val center = plane.centerPose
             val y = center.ty()
-            if (y > camera.y - 0.8f || y < camera.y - 2.3f) continue
-            if (kotlin.math.hypot((center.tx() - camera.x).toDouble(), (center.tz() - camera.z).toDouble()) > 6.0) continue
+            if (y > camera.y - FLOOR_MIN_BELOW_M || y < camera.y - FLOOR_MAX_BELOW_M) continue
+            if (kotlin.math.hypot((center.tx() - camera.x).toDouble(), (center.tz() - camera.z).toDouble()) > 8.0) continue
             if (lowest == null || y < lowest) lowest = y
         }
         return lowest
+    }
+
+    /**
+     * An instant floor reading that needs no detected plane: a ray straight down from the camera, hit against planes
+     * and the depth map. Planes take seconds to appear; depth answers on the first frames.
+     */
+    fun floorHeightByRay(frame: Frame, camera: Vec3): Float? {
+        val hits = frame.hitTest(floatArrayOf(camera.x, camera.y, camera.z), 0, floatArrayOf(0f, -1f, 0f), 0)
+        for (hit in hits) {
+            val trackable = hit.trackable
+            val usable = (trackable is Plane && trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING && trackable.isPoseInPolygon(hit.hitPose)) ||
+                trackable is DepthPoint
+            if (!usable) continue
+            val y = hit.hitPose.ty()
+            if (y <= camera.y - FLOOR_MIN_BELOW_M && y >= camera.y - FLOOR_MAX_BELOW_M) return y
+        }
+        return null
     }
 
     /**
@@ -162,7 +184,14 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
      * around it and the middle one is used, so a single noisy depth sample (or the edge of an object) can't throw
      * the position off. Needs [configure] with `aiming = true`.
      */
-    fun surfaceAt(frame: Frame, session: Session, xPx: Float, yPx: Float, maxDistanceM: Float = 6f): SurfaceHit? {
+    fun surfaceAt(
+        frame: Frame,
+        session: Session,
+        xPx: Float,
+        yPx: Float,
+        maxDistanceM: Float = 6f,
+        preferPlane: Boolean = true,
+    ): SurfaceHit? {
         fun usable(result: HitResult): Boolean {
             val trackable = result.trackable
             return result.distance <= maxDistanceM && when (trackable) {
@@ -175,8 +204,16 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
         fun position(p: com.google.ar.core.Pose) = Vec3(p.tx(), p.ty(), p.tz())
 
         val atTap = frame.hitTest(xPx, yPx).filter(::usable)
-        atTap.firstOrNull { it.trackable is Plane }?.let { plane ->
-            return SurfaceHit(position(plane.hitPose), isPlane = true) { plane.createAnchor() }
+        if (preferPlane) {
+            atTap.firstOrNull { it.trackable is Plane }?.let { plane ->
+                return SurfaceHit(position(plane.hitPose), isPlane = true) { plane.createAnchor() }
+            }
+        } else {
+            // When capturing a foreground object (e.g. a bottle on a table), pick the closest hit so we don't
+            // measure the background plane behind the object.
+            atTap.minByOrNull { it.distance }?.let { closest ->
+                return SurfaceHit(position(closest.hitPose), isPlane = closest.trackable is Plane) { closest.createAnchor() }
+            }
         }
         val spread = 12f
         val samples = listOf(0f to 0f, spread to 0f, -spread to 0f, 0f to spread, 0f to -spread).mapNotNull { (dx, dy) ->
@@ -189,6 +226,10 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
 
     companion object {
         const val REDETECT_INTERVAL_MS = 1_500L
+
+        /** A floor is between these distances below the phone (tables are higher; lower is a hole or noise). */
+        const val FLOOR_MIN_BELOW_M = 0.5f
+        const val FLOOR_MAX_BELOW_M = 2.8f
 
         /** The wording the iOS app uses for each tracking problem. */
         fun trackingMessage(frame: Frame): String? {

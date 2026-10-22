@@ -15,7 +15,8 @@ fun Venue.withExtraMarkers(extra: List<Venue.Marker>): Venue {
     val existingIDs = markers.map { it.id }.toSet()
     val additions = extra.filter { it.level in levelIDs && it.id !in existingIDs && it.physicalWidth > 0f }
     if (additions.isEmpty()) return this
-    return copy(markers = markers + additions)
+    // Place captured reference points first so camera prompt banners (.take(6)/.take(8)) always show them.
+    return copy(markers = additions + markers)
 }
 
 /** A captured reference point on disk: the venue it belongs to and its marker (whose [Venue.Marker.image] is an
@@ -38,22 +39,22 @@ class CapturedMarkerStore(private val directory: File) {
     /** The folder captured images should be written into (same place as the metadata). */
     fun imageFile(id: String): File = File(directory, "$id.png")
 
-    // The image is stored as a bare filename ("<id>.png") so a saved file is portable between devices; on load it is
-    // resolved to the current device's absolute path. Older files that stored an absolute path still work, because the
-    // path is always recomputed from the marker id here.
     fun load(venueId: String): List<Venue.Marker> =
         directory.listFiles { f -> f.isFile && f.name.endsWith(".json") }.orEmpty()
             .mapNotNull { file ->
                 runCatching { json.decodeFromString(StoredMarker.serializer(), file.readText()) }.getOrNull()
             }
             .filter { it.venueId == venueId }
-            .map { it.marker.copy(image = imageFile(it.marker.id).absolutePath) }
+            .map {
+                val raw = File(it.marker.image)
+                val resolved = if (raw.isAbsolute && raw.exists()) raw else imageFile(it.marker.id)
+                it.marker.copy(image = resolved.absolutePath)
+            }
             .filter { File(it.image).exists() }
 
     fun save(venueId: String, marker: Venue.Marker) {
         val target = File(directory, "${marker.id}.json")
         val tmp = File(directory, "${marker.id}.json.tmp")
-        // Persist only the filename, not an absolute path, so the JSON is portable.
         val portable = marker.copy(image = imageFile(marker.id).name)
         tmp.writeText(json.encodeToString(StoredMarker.serializer(), StoredMarker(venueId, portable)))
         tmp.renameTo(target)
@@ -69,4 +70,38 @@ class CapturedMarkerStore(private val directory: File) {
         directory.listFiles { f -> f.isFile && (f.name.endsWith(".json") || f.name.endsWith(".png")) }
             .orEmpty().forEach { it.delete() }
     }
+}
+
+/** [Venue.POI.category] of a captured reference point listed as a place to navigate to. */
+const val REFERENCE_CATEGORY = "reference"
+
+/** How far in front of a captured reference point (meters) the user is taken: where they can see it again. */
+private const val REFERENCE_STAND_OFF_M = 1.5f
+
+/** POI id of the reference point [markerId]. */
+fun referencePoiId(markerId: String) = "refpoi-$markerId"
+
+/** Destinations whose routes follow the walked paths rather than the venue network. */
+val Venue.POI.followsWalkedPaths: Boolean
+    get() = category == CustomDestination.CATEGORY || category == REFERENCE_CATEGORY
+
+/**
+ * Lists each captured reference point as a destination, standing [REFERENCE_STAND_OFF_M] in front of its image, so
+ * "from here" can offer every point the admin marked along the way, and tapping one navigates to it.
+ */
+fun Venue.withReferenceDestinations(captured: List<Venue.Marker>): Venue {
+    val levelIDs = levels.map { it.id }.toSet()
+    val takenIDs = pois.map { it.id }.toMutableSet()
+    val added = captured.filter { it.level in levelIDs }.mapNotNull { marker ->
+        val id = referencePoiId(marker.id)
+        if (!takenIDs.add(id)) return@mapNotNull null
+        val facing = Math.toRadians(marker.facing.toDouble())
+        Venue.POI(
+            id = id, name = marker.name, category = REFERENCE_CATEGORY, level = marker.level,
+            x = marker.x + kotlin.math.sin(facing).toFloat() * REFERENCE_STAND_OFF_M,
+            z = marker.z + kotlin.math.cos(facing).toFloat() * REFERENCE_STAND_OFF_M,
+            node = "",
+        )
+    }
+    return if (added.isEmpty()) this else copy(pois = pois + added)
 }

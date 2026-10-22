@@ -2,31 +2,36 @@ package com.app.androidnativearcore
 
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
-import java.io.ByteArrayInputStream
+import android.net.Uri
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -44,33 +49,39 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.app.androidnativearcore.ui.designkit.IosRow
 import com.app.androidnativearcore.ui.designkit.IosRowDivider
 import com.app.androidnativearcore.ui.designkit.IosSection
-import com.app.androidnativearcore.wayfinder.ar.CapturedReferencePoint
+import com.app.androidnativearcore.wayfinder.ar.LocatedUser
 import com.app.androidnativearcore.wayfinder.ar.NavigationFeedback
 import com.app.androidnativearcore.wayfinder.ar.WayFinderCaptureScreen
+import com.app.androidnativearcore.wayfinder.ar.WayFinderLocateScreen
 import com.app.androidnativearcore.wayfinder.ar.WayFinderNavigationListener
 import com.app.androidnativearcore.wayfinder.ar.WayFinderNavigationScreen
-import com.app.androidnativearcore.wayfinder.core.CustomDestination
 import com.app.androidnativearcore.wayfinder.core.ArPath
 import com.app.androidnativearcore.wayfinder.core.ArPathStore
 import com.app.androidnativearcore.wayfinder.core.CapturedMarkerStore
+import com.app.androidnativearcore.wayfinder.core.CustomDestination
 import com.app.androidnativearcore.wayfinder.core.LocalizedText
+import com.app.androidnativearcore.wayfinder.core.PlacedObject
+import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
 import com.app.androidnativearcore.wayfinder.core.Route
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
 import com.app.androidnativearcore.wayfinder.core.withCustomDestinations
 import com.app.androidnativearcore.wayfinder.core.withExtraMarkers
+import com.app.androidnativearcore.wayfinder.core.withReferenceDestinations
 import com.google.ar.core.ArCoreApk
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.util.UUID
 
@@ -80,8 +91,13 @@ private sealed interface Screen {
     data object Home : Screen
     data object List : Screen
     data object Signs : Screen
-    data object Capture : Screen
-    data class Navigate(val poi: Venue.POI, val profile: RouteProfile) : Screen
+    data class Capture(val fromRefId: String? = null, val connectTargetId: String? = null) : Screen
+    /** User flow, step 1: the camera recognizes a reference point. */
+    data object Locate : Screen
+    /** User flow, step 2: every other point reachable from where the user stands. */
+    data class Nearby(val located: LocatedUser) : Screen
+    /** [from] is where the user was found, when they came through the user flow; they return there afterwards. */
+    data class Navigate(val poi: Venue.POI, val profile: RouteProfile, val from: LocatedUser? = null) : Screen
 }
 
 /** The venue package bundled with the demo app. A production app would download and cache packages per venue. */
@@ -136,15 +152,52 @@ private fun WayFinderHost(basePackage: VenuePackage) {
     val customDestinations = paths.map { it.destination }
     val pkg = remember(basePackage, customDestinations, extraMarkers) {
         basePackage.withVenue(
-            basePackage.venue.withCustomDestinations(customDestinations).withExtraMarkers(extraMarkers),
+            basePackage.venue.withCustomDestinations(customDestinations).withExtraMarkers(extraMarkers)
+                .withReferenceDestinations(extraMarkers),
         )
     }
+    // Every walk joined together: from any reference point, routes can follow any path walked from the entry.
+    val allWalkedPoints = remember(paths) { paths.flatMap { it.walkedPoints } }
+    val allPlacedObjects = remember(paths) { paths.flatMap { it.objects } }
     var mode by remember { mutableStateOf(AppMode.USER) }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     var stepFree by remember { mutableStateOf(false) }
 
+    fun openLiveCamera() {
+        val firstPoi = pkg.venue.pois.firstOrNull { it.category == CustomDestination.CATEGORY }
+            ?: pkg.venue.pois.firstOrNull { it.category == REFERENCE_CATEGORY }
+            ?: pkg.venue.pois.firstOrNull()
+        if (firstPoi != null) {
+            screen = Screen.Navigate(firstPoi, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST)
+        } else {
+            screen = Screen.Locate
+        }
+    }
+
     when (val current = screen) {
-        Screen.Home -> HomeScreen(onPick = { picked -> mode = picked; screen = Screen.List })
+        Screen.Home -> HomeScreen(onPick = { picked ->
+            mode = picked
+            screen = Screen.List
+        })
+        Screen.Locate -> WayFinderLocateScreen(
+            pkg = pkg,
+            onLocated = { screen = Screen.Nearby(it) },
+            onCancel = { screen = Screen.List },
+        )
+        is Screen.Nearby -> {
+            BackHandler { screen = Screen.List }
+            NearbyScreen(
+                venue = pkg.venue,
+                markers = pkg.venue.markers,
+                walked = allWalkedPoints,
+                located = current.located,
+                onNavigate = { poi ->
+                    screen = Screen.Navigate(poi, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST, current.located)
+                },
+                onRescan = { screen = Screen.Locate },
+                onBack = { screen = Screen.List },
+            )
+        }
         Screen.List -> {
             BackHandler { screen = Screen.Home }
             DestinationListScreen(
@@ -155,14 +208,17 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 onBack = { screen = Screen.Home },
                 onNavigate = { screen = Screen.Navigate(it, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST) },
                 onOpenSigns = { screen = Screen.Signs },
-                onAddDestination = { screen = Screen.Capture },
+                onAddDestination = { screen = Screen.Capture() },
+                onWalkAndConnect = { fromRefId, targetId ->
+                    screen = Screen.Capture(fromRefId = fromRefId, connectTargetId = targetId)
+                },
+                placedObjects = allPlacedObjects,
                 onDeleteDestination = { // deletes that path's file: its walk and objects go with it
                     store.delete(it.id)
                     paths = store.load(basePackage.venue.id)
                 },
                 onRenameDestination = { poi, newName ->
                     paths.firstOrNull { it.destination.id == poi.id }?.let { path ->
-                        // Same id, new name: remove the old file (named by the old slug) then save under the new one.
                         store.delete(poi.id)
                         store.save(path.copy(destination = path.destination.copy(name = newName)))
                         paths = store.load(basePackage.venue.id)
@@ -177,15 +233,16 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     extraMarkers = markerStore.load(basePackage.venue.id)
                 },
                 onOpenCamera = {
-                    // Direct camera for visitors: jump into AR without picking from the list first.
-                    pkg.venue.pois.firstOrNull()?.let {
-                        screen = Screen.Navigate(it, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST)
-                    }
+                    openLiveCamera()
                 },
             )
         }
-        Screen.Capture -> WayFinderCaptureScreen(
+        is Screen.Capture -> WayFinderCaptureScreen(
             pkg = pkg,
+            existingWalkedPoints = allWalkedPoints,
+            existingObjects = allPlacedObjects,
+            initialFromRefId = current.fromRefId,
+            initialConnectTargetId = current.connectTargetId,
             onSave = { captured ->
                 store.save(
                     ArPath(
@@ -202,12 +259,11 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                         driftCorrectedCm = captured.driftCorrectedCm,
                     ),
                 )
-                paths = store.load(basePackage.venue.id)
-                extraMarkers = markerStore.load(basePackage.venue.id)
-                screen = Screen.List
+                // Keep the admin in the live camera view! Reload paths on exit so ARSceneView is not torn down mid-session.
             },
             onCancel = {
-                // Reference points captured during this session are kept even if no destination was saved.
+                // Reload saved destinations and reference points captured during this session when closing camera.
+                paths = store.load(basePackage.venue.id)
                 extraMarkers = markerStore.load(basePackage.venue.id)
                 screen = Screen.List
             },
@@ -229,6 +285,32 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     ),
                 )
                 // Don't refresh `extraMarkers` now: it would rebuild the AR session mid-capture. It reloads on exit.
+            },
+            onUpdateReferencePointCoords = { id, x, y, z ->
+                markerStore.load(basePackage.venue.id).firstOrNull { it.id == id }?.let { existing ->
+                    markerStore.save(basePackage.venue.id, existing.copy(x = x, y = y, z = z))
+                }
+            },
+            onDeleteReferencePoint = { id, name ->
+                if (id.isNotEmpty()) {
+                    markerStore.delete(id)
+                } else {
+                    markerStore.load(basePackage.venue.id)
+                        .filter { it.name.resolved() == name }
+                        .forEach { markerStore.delete(it.id) }
+                }
+            },
+            onDeleteObject = { objId ->
+                store.load(basePackage.venue.id).forEach { path ->
+                    if (path.objects.any { it.id == objId }) {
+                        store.save(path.copy(objects = path.objects.filterNot { it.id == objId }))
+                    }
+                }
+            },
+            onOpenSigns = {
+                paths = store.load(basePackage.venue.id)
+                extraMarkers = markerStore.load(basePackage.venue.id)
+                screen = Screen.Signs
             },
         )
         Screen.Signs -> {
@@ -270,7 +352,7 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                     }
 
                     override fun onFinished() {
-                        screen = Screen.List
+                        screen = current.from?.let { Screen.Nearby(it) } ?: Screen.List
                     }
                 }
             }
@@ -279,10 +361,9 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 destinationId = current.poi.id,
                 profile = current.profile,
                 listener = listener,
-                // Routes follow the destination's own path, and only its objects are shown.
-                walkedPoints = paths.firstOrNull { it.destination.id == current.poi.id }?.walkedPoints.orEmpty(),
-                placedObjects = paths.firstOrNull { it.destination.id == current.poi.id }?.objects.orEmpty(),
-                recordedFromMarkerId = paths.firstOrNull { it.destination.id == current.poi.id }?.startMarkerId.orEmpty(),
+                walkedPoints = allWalkedPoints,
+                placedObjects = allPlacedObjects,
+                recordedFromMarkerId = "",
                 debug = true,
             )
         }
@@ -300,6 +381,8 @@ private fun DestinationListScreen(
     onNavigate: (Venue.POI) -> Unit,
     onOpenSigns: () -> Unit,
     onAddDestination: () -> Unit,
+    onWalkAndConnect: (fromRefId: String?, targetId: String?) -> Unit = { _, _ -> },
+    placedObjects: List<PlacedObject> = emptyList(),
     onDeleteDestination: (Venue.POI) -> Unit,
     onRenameDestination: (Venue.POI, String) -> Unit = { _, _ -> },
     onDataChanged: () -> Unit = {},
@@ -309,13 +392,18 @@ private fun DestinationListScreen(
     val context = LocalContext.current
     val venue = pkg.venue
     val admin = mode == AppMode.ADMIN
-    val capturedCount = venue.markers.count { it.id.startsWith("ref-") }
+    val refMarkers = remember(venue.markers) { venue.markers.filter { it.id.startsWith("ref-") } }
+    val customPois = remember(venue.pois) { venue.pois.filter { it.category == CustomDestination.CATEGORY } }
+    val userObjects = remember(placedObjects) { placedObjects.filter { !it.isReference } }
+    val capturedCount = refMarkers.size
     var search by remember { mutableStateOf("") }
     var unsupported by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<Venue.POI?>(null) }
     var deleting by remember { mutableStateOf<Venue.POI?>(null) }
     var clearing by remember { mutableStateOf(false) }
     var transferMsg by remember { mutableStateOf<String?>(null) }
+    var showConnectDialog by remember { mutableStateOf(false) }
+    var selectedFromRefId by remember(refMarkers) { mutableStateOf(refMarkers.firstOrNull()?.id) }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -337,7 +425,6 @@ private fun DestinationListScreen(
     }
 
     fun start(poi: Venue.POI) {
-        // Like ARWorldTrackingConfiguration.isSupported on iOS: only a device that can't run ARCore is refused.
         if (ArCoreApk.getInstance().checkAvailability(context) == ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE) {
             unsupported = true
         } else {
@@ -347,9 +434,9 @@ private fun DestinationListScreen(
 
     Scaffold(
         floatingActionButton = {
-            if (!admin && venue.pois.isNotEmpty()) {
+            if (!admin) {
                 ExtendedFloatingActionButton(
-                    text = { Text("Camera") },
+                    text = { Text("Scan & Map") },
                     icon = { Text("📷") },
                     onClick = onOpenCamera,
                 )
@@ -381,10 +468,88 @@ private fun DestinationListScreen(
                 )
             }
 
+            if (!admin) {
+                item {
+                    IosSection {
+                        IosRow(
+                            title = "Scan reference point",
+                            glyph = "📷",
+                            subtitle = "Match a reference point to see nearby list & 2D map",
+                            onClick = onOpenCamera,
+                        )
+                    }
+                }
+            }
+
             if (admin) {
                 item {
                     IosSection {
+                        IosRow(
+                            title = "Connect reference points & objects",
+                            glyph = "🔗",
+                            subtitle = "Walk from one reference point to another ($capturedCount ref pts · ${userObjects.size} objects)",
+                            onClick = { showConnectDialog = true },
+                        )
+                        IosRowDivider()
                         IosRow(title = "Add destination", glyph = "＋", subtitle = "Scan a sign, walk, save a spot", onClick = onAddDestination)
+                        IosRowDivider()
+                        IosRow(
+                            title = "Scan reference point & 2D Map",
+                            glyph = "🗺",
+                            subtitle = "Test matching & view the floor map",
+                            onClick = onOpenCamera,
+                        )
+                    }
+                }
+                if (refMarkers.isNotEmpty() || customPois.isNotEmpty() || userObjects.isNotEmpty()) {
+                    item {
+                        IosSection(title = "Reference points, destinations & objects (walk & connect)") {
+                            val fromMarker = refMarkers.firstOrNull { it.id == selectedFromRefId } ?: refMarkers.firstOrNull()
+                            val fromLabel = fromMarker?.name?.resolved() ?: "Start point"
+                            refMarkers.forEachIndexed { idx, marker ->
+                                val isStart = marker.id == fromMarker?.id
+                                IosRow(
+                                    title = "📍 ${marker.name.resolved()}",
+                                    glyph = "🔗",
+                                    subtitle = if (isStart) {
+                                        "Selected as Start (From) · Tap to pick target to connect"
+                                    } else {
+                                        "Tap to walk & connect from 📍 $fromLabel → 📍 ${marker.name.resolved()}"
+                                    },
+                                    onClick = {
+                                        if (isStart && refMarkers.size + customPois.size + userObjects.size > 1) {
+                                            showConnectDialog = true
+                                        } else {
+                                            onWalkAndConnect(fromMarker?.id, marker.id)
+                                        }
+                                    },
+                                )
+                                if (idx < refMarkers.lastIndex || customPois.isNotEmpty() || userObjects.isNotEmpty()) IosRowDivider()
+                            }
+                            customPois.forEachIndexed { idx, poi ->
+                                IosRow(
+                                    title = "⭐ ${poi.name.resolved()}",
+                                    glyph = "🔗",
+                                    subtitle = "Tap to walk & connect from 📍 $fromLabel → ⭐ ${poi.name.resolved()}",
+                                    onClick = {
+                                        onWalkAndConnect(fromMarker?.id, poi.id)
+                                    },
+                                )
+                                if (idx < customPois.lastIndex || userObjects.isNotEmpty()) IosRowDivider()
+                            }
+                            userObjects.forEachIndexed { idx, obj ->
+                                val label = obj.text.ifBlank { obj.kind.label }
+                                IosRow(
+                                    title = "${obj.kind.glyph} $label",
+                                    glyph = "🔗",
+                                    subtitle = "Tap to walk & connect from 📍 $fromLabel → ${obj.kind.glyph} $label",
+                                    onClick = {
+                                        onWalkAndConnect(fromMarker?.id, obj.id)
+                                    },
+                                )
+                                if (idx < userObjects.lastIndex) IosRowDivider()
+                            }
+                        }
                     }
                 }
                 item {
@@ -454,13 +619,183 @@ private fun DestinationListScreen(
                     IosRow(
                         title = "AR signs",
                         glyph = "🏷",
-                        subtitle = if (admin) "Print & place markers" else "Where to scan",
+                        subtitle = if (admin) "Print, add & manage markers" else "Where to scan",
                         onClick = onOpenSigns,
                     )
                 }
                 Spacer(Modifier.padding(8.dp))
             }
         }
+    }
+
+    if (showConnectDialog) {
+        AlertDialog(
+            onDismissRequest = { showConnectDialog = false },
+            title = { Text("Walk & Connect Reference Points / Objects") },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        "1. Pick Starting Reference Point (From):",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                    )
+                    if (refMarkers.isEmpty()) {
+                        Text(
+                            "No reference points captured yet — open the camera and tap ◎ to capture reference points first.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        refMarkers.forEach { m ->
+                            val isSelected = m.id == selectedFromRefId
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelected) Color(0x220A84FF) else Color.Transparent)
+                                    .clickable { selectedFromRefId = m.id }
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "📍 ${m.name.resolved()}",
+                                    color = Color(0xFF0A84FF),
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                )
+                                Text(
+                                    if (isSelected) "✓ Start From" else "Select as Start",
+                                    fontSize = 12.sp,
+                                    color = if (isSelected) Color(0xFF0A84FF) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                )
+                            }
+                        }
+                    }
+
+                    Text(
+                        "2. Tap Target Destination, Reference Point, or Object to Walk & Connect To:",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    val fromName = refMarkers.firstOrNull { it.id == selectedFromRefId }?.name?.resolved() ?: "Start point"
+                    val targetRefs = refMarkers.filter { it.id != selectedFromRefId || refMarkers.size == 1 }
+                    if (targetRefs.isEmpty() && customPois.isEmpty() && userObjects.isEmpty()) {
+                        Text(
+                            "Tap 'Open Camera' below to capture more reference points or place 3D objects and connect them.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        targetRefs.forEach { target ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0x1834C759))
+                                    .clickable {
+                                        showConnectDialog = false
+                                        onWalkAndConnect(selectedFromRefId, target.id)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "📍 ${target.name.resolved()}",
+                                        color = Color(0xFF0A84FF),
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "Walk from 📍 $fromName → 📍 ${target.name.resolved()}",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                        customPois.forEach { poi ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0x1834C759))
+                                    .clickable {
+                                        showConnectDialog = false
+                                        onWalkAndConnect(selectedFromRefId, poi.id)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "⭐ ${poi.name.resolved()}",
+                                        color = Color(0xFFFF9500),
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "Walk from 📍 $fromName → ⭐ ${poi.name.resolved()}",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                        userObjects.forEach { obj ->
+                            val label = obj.text.ifBlank { obj.kind.label }
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0x1834C759))
+                                    .clickable {
+                                        showConnectDialog = false
+                                        onWalkAndConnect(selectedFromRefId, obj.id)
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "${obj.kind.glyph} $label",
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "Walk from 📍 $fromName → ${obj.kind.glyph} $label",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showConnectDialog = false
+                        val defaultTarget = refMarkers.firstOrNull { it.id != selectedFromRefId }?.id
+                            ?: customPois.firstOrNull()?.id
+                            ?: userObjects.firstOrNull()?.id
+                        onWalkAndConnect(selectedFromRefId, defaultTarget)
+                    },
+                ) { Text("Open Camera") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConnectDialog = false }) { Text("Close") }
+            },
+        )
     }
 
     editing?.let { poi ->
@@ -618,11 +953,18 @@ private fun MarkerGalleryScreen(
                 val bitmap = remember(marker) { BitmapFactory.decodeFile(pkg.file(marker).path) }
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (bitmap != null) {
+                        val ratio = remember(bitmap) {
+                            (bitmap.width.toFloat() / bitmap.height.toFloat().coerceAtLeast(1f)).coerceIn(0.4f, 2.5f)
+                        }
                         Image(
                             bitmap = bitmap.asImageBitmap(),
                             contentDescription = marker.name.resolved(),
-                            contentScale = ContentScale.FillWidth,
-                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)),
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 260.dp)
+                                .aspectRatio(ratio)
+                                .clip(RoundedCornerShape(12.dp)),
                         )
                     }
                     Text(marker.name.resolved(), style = MaterialTheme.typography.titleMedium)
@@ -659,29 +1001,56 @@ private fun MarkerGalleryScreen(
     picked?.let { bitmap ->
         var name by remember(bitmap) { mutableStateOf("") }
         var widthCm by remember(bitmap) { mutableStateOf("20") }
+        val ratio = remember(bitmap) {
+            (bitmap.width.toFloat() / bitmap.height.toFloat().coerceAtLeast(1f)).coerceIn(0.4f, 2.5f)
+        }
         AlertDialog(
             onDismissRequest = { picked = null },
             title = { Text("Add AR sign") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Image(
-                        bitmap = bitmap.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)),
-                    )
-                    OutlinedTextField(value = name, onValueChange = { name = it }, singleLine = true, label = { Text("Name") })
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .heightIn(max = 180.dp)
+                                .aspectRatio(ratio)
+                                .clip(RoundedCornerShape(10.dp)),
+                        )
+                    }
                     OutlinedTextField(
-                        value = widthCm, onValueChange = { widthCm = it.filter(Char::isDigit).take(4) },
-                        singleLine = true, label = { Text("Printed width (cm)") },
+                        value = name,
+                        onValueChange = { name = it },
+                        singleLine = true,
+                        label = { Text("Name (required)") },
+                        placeholder = { Text("e.g. Room door sign") },
+                        modifier = Modifier.fillMaxWidth(),
                     )
-                    Text("Position isn't set — scan this sign in capture to place it accurately.",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedTextField(
+                        value = widthCm,
+                        onValueChange = { widthCm = it.filter(Char::isDigit).take(4) },
+                        singleLine = true,
+                        label = { Text("Physical width (cm)") },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "Position isn't set — scan this sign in capture to place it accurately.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             },
             confirmButton = {
-                val cm = widthCm.toFloatOrNull() ?: 0f
+                val cm = (widthCm.toFloatOrNull() ?: 20f).coerceAtLeast(1f)
+                val resolvedName = name.trim().ifEmpty { "Sign ${pkg.venue.markers.size + 1}" }
                 TextButton(
-                    enabled = name.isNotBlank() && cm > 0f && onAddSign != null,
-                    onClick = { onAddSign?.invoke(name.trim(), cm / 100f, bitmap); picked = null },
+                    enabled = onAddSign != null,
+                    onClick = { onAddSign?.invoke(resolvedName, cm / 100f, bitmap); picked = null },
                 ) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { picked = null }) { Text("Cancel") } },

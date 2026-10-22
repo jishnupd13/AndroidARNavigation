@@ -81,6 +81,10 @@ private fun SceneScope.PlacedObjectNode(obj: PlacedObject, cameraPosition: () ->
             PlacedObjectKind.BALLOON -> Balloon()
             PlacedObjectKind.MESSAGE -> MessageSign(obj.text, cameraPosition)
         }
+        // The name the user gave the object, floating above it (a message already is its own text).
+        if (obj.kind != PlacedObjectKind.MESSAGE && obj.text.isNotBlank()) {
+            ObjectLabel(obj.text, labelHeightFor(obj.kind), cameraPosition)
+        }
     }
 }
 
@@ -146,6 +150,29 @@ private fun SceneScope.Balloon() {
         SphereNode(radius = 0.15f, scale = Scale(1f, 1.25f, 1f), materialInstance = red)
         ConeNode(radius = 0.025f, height = 0.04f, position = Position(y = -0.2f), rotation = Rotation(x = 180f), materialInstance = red)
     }
+}
+
+/** Height (meters, before the object's own scaling) at which the name floats: just above the top of each shape. */
+private fun labelHeightFor(kind: PlacedObjectKind): Float = when (kind) {
+    PlacedObjectKind.CUP -> 0.3f
+    PlacedObjectKind.GIFT -> 0.42f
+    PlacedObjectKind.STAR -> 1.05f
+    PlacedObjectKind.BALLOON -> 1.6f
+    PlacedObjectKind.MESSAGE -> 0.8f
+}
+
+/** The object's name as a pill that always turns toward the camera. */
+@Composable
+private fun SceneScope.ObjectLabel(text: String, height: Float, cameraPosition: () -> Position) {
+    val bitmap = remember(text) { Badges.bitmap(text, null, ObjectColors.messageBlue.toArgb()) }
+    val labelHeight = 0.1f
+    BillboardNode(
+        bitmap = bitmap,
+        widthMeters = labelHeight * bitmap.width / bitmap.height,
+        heightMeters = labelHeight,
+        position = Position(y = height),
+        cameraPositionProvider = cameraPosition,
+    )
 }
 
 /** A text label on a short post, always turned toward the camera. */
