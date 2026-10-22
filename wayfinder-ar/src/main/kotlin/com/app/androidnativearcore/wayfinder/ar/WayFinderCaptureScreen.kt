@@ -702,7 +702,7 @@ fun WayFinderCaptureScreen(
                             instruction = if (canSave) "Walk to the destination, then save it" else "Walk to where the destination is",
                             glyph = "●",
                             detail = trackingMessage ?: listOfNotNull(
-                                levelName.ifEmpty { null }, recordedSummary.ifEmpty { null }, signAgreement.ifEmpty { null },
+                                recordedSummary.ifEmpty { null }, signAgreement.ifEmpty { null },
                                 if (objectCount > 0) "$objectCount object${if (objectCount == 1) "" else "s"}" else null,
                             ).joinToString(" · "),
                         ),
