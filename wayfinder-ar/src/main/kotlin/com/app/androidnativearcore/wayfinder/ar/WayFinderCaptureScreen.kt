@@ -178,6 +178,12 @@ private fun displayRotationDegrees(view: android.view.View): Int = when (view.di
     else -> 90
 }
 
+/** Log tag for accuracy diagnostics: reference captures, object placement, alignment and tracking events. */
+internal const val ACCURACY_TAG = "WFAccuracy"
+
+/** A new reference point closer than this (meters) to an existing one is reported as a duplicate. */
+private const val DUPLICATE_REFERENCE_M = 0.3f
+
 /** Why a reference point can't be added or a walk started yet: the saved map hasn't been found in this session. */
 private const val NOT_ON_MAP_YET = "First point the camera at a sign or a saved reference point and hold it until it " +
     "is recognized, so new points are saved on the same map as the others."
@@ -341,6 +347,9 @@ fun WayFinderCaptureScreen(
     var pendingRef by remember { mutableStateOf<RefCapture?>(null) }
     var refFailure by remember { mutableStateOf<String?>(null) } // why the last reference capture was refused
     var a4Frame by remember { mutableStateOf<FloatArray?>(null) } // the A4 photo frame on screen: left, top, right, bottom
+    // Set when tracking was lost long enough that the session frame may have been re-based: from then on, new points
+    // need the map to be found again even in a place that had no saved map (the earlier ones are in the old frame).
+    val mapFrameLost = remember { BooleanArray(1) }
     val captureReq = remember { BooleanArray(1) }
     var autoPoints by remember { mutableStateOf(false) }
     val lastAutoProgress = remember { FloatArray(1) }
@@ -367,12 +376,15 @@ fun WayFinderCaptureScreen(
     LaunchedEffect(greenFlash) { if (greenFlash != null) { delay(1500); greenFlash = null } }
 
     val view = LocalView.current
+    // The map alignment as drawn: anchored to the real world and changed smoothly (see StableAlignment).
+    val stable = remember { StableAlignment() }
     DisposableEffect(view) {
         view.keepScreenOn = true
         onDispose {
             view.keepScreenOn = false
             anchors.values.forEach { it.detach() }
             anchors.clear()
+            stable.release()
         }
     }
     BackHandler(onBack = onCancel)
@@ -397,6 +409,12 @@ fun WayFinderCaptureScreen(
     val hadSavedMap = remember(pkg) {
         venue.markers.any { it.id.startsWith("ref-") } || venue.pois.any { it.category == CustomDestination.CATEGORY }
     }
+
+    /**
+     * Whether new things can be measured into the map now. With a saved map (or after the session frame may have been
+     * re-based) that needs the map to have been found in this session by recognizing a sign or reference point.
+     */
+    fun onMap(): Boolean = filter.isLockedIn || !(hadSavedMap || mapFrameLost[0])
 
     // Combine saved reference points from venue + newly captured reference points in this session (deduped by name/pos).
     val allRefPins = remember(venue.markers, sessionRefPins.size, deletedRefIds.size, deletedRefNames.size) {
@@ -470,16 +488,32 @@ fun WayFinderCaptureScreen(
         anchors.clear()
     }
 
+    /**
+     * Places the selected object where the user tapped: on the surface ARCore measured there, or, where it measured
+     * none, on the detected floor along the tapped direction. With neither, nothing is placed: a spot guessed at a
+     * fixed distance from the camera would be wherever the phone happened to be, not where the user meant.
+     */
     fun handleTap(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session, x: Float, y: Float) {
+        if (frame.camera.trackingState != TrackingState.TRACKING) {
+            showToast("Tracking is limited right now. Hold still for a moment, then tap again.", 2_500)
+            return
+        }
+        if (!onMap()) {
+            showToast(NOT_ON_MAP_YET, 4_500)
+            return
+        }
         val cameraPosition = Vec3(camera[0], camera[1], camera[2])
         val hit = markerTracker.surfaceAt(frame, session, x, y, MAX_OBJECT_DISTANCE_M)
         val onSurface = hit != null
         val wanted = hit?.position ?: run {
             val (origin, direction) = markerTracker.rayThrough(frame, x, y, view.width.toFloat(), view.height.toFloat())
-            val floor = floorSessionY()
-            val toFloor = if (direction.y < -0.05f) (floor - origin.y) / direction.y else -1f
-            val along = if (toFloor in 0.5f..MAX_OBJECT_DISTANCE_M) toFloor else 1.5f
-            Vec3(origin.x + direction.x * along, if (toFloor in 0.5f..MAX_OBJECT_DISTANCE_M) floor else origin.y + direction.y * along, origin.z + direction.z * along)
+            val toFloor = if (floorFound && direction.y < -0.05f) (floorSessionY() - origin.y) / direction.y else -1f
+            if (toFloor !in 0.5f..MAX_OBJECT_DISTANCE_M) {
+                showToast("Couldn't find a surface there. Move the phone slowly so ARCore can see it, then tap again.", 3_000)
+                android.util.Log.i(ACCURACY_TAG, "Object tap refused: no surface and no floor along the ray")
+                return
+            }
+            Vec3(origin.x + direction.x * toFloor, floorSessionY(), origin.z + direction.z * toFloor)
         }
         val spot = spreadObjectPosition(wanted, sessionObjects.map { it.position }, MIN_OBJECT_SEPARATION_M)
         val id = "object-" + java.util.UUID.randomUUID()
@@ -487,6 +521,13 @@ fun WayFinderCaptureScreen(
         else session.createAnchor(Pose(floatArrayOf(spot.x, spot.y, spot.z), floatArrayOf(0f, 0f, 0f, 1f)))
         val yaw = Math.toDegrees(kotlin.math.atan2((cameraPosition.x - spot.x).toDouble(), (cameraPosition.z - spot.z).toDouble())).toFloat()
         val distance = spot.distanceTo(cameraPosition)
+        android.util.Log.i(
+            ACCURACY_TAG,
+            "Object placed: ${selectedKind.label} %s at session (%.2f, %.2f, %.2f), %.2f m away, anchor=%s".format(
+                if (hit == null) "on floor (no surface)" else if (hit.isPlane) "on plane" else "on depth point",
+                spot.x, spot.y, spot.z, distance, anchors[id]?.trackingState,
+            ),
+        )
         objectProgress[id] = recorder.progress
         sessionObjects += PlacedObject(
             id = id, kind = selectedKind, level = "", x = spot.x, y = spot.y, z = spot.z, yawDegrees = yaw,
@@ -589,11 +630,28 @@ fun WayFinderCaptureScreen(
         val rightVenue = venueFromSession.transformPoint(hitPos + right) - surfaceVenue
         val facing = ReferenceGeometry.facingDegrees(rightVenue)
         val level = user.level.ifEmpty { startMarker?.level ?: defaultLevel }
-        return RefCapture(bitmap, physicalWidth, level, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z, facing, detail, accepted, distance, problem)
+        // Two reference points on the same spot only compete with each other when the camera sees them.
+        val duplicate = allRefPins.minByOrNull { hypot(it.x - surfaceVenue.x, it.z - surfaceVenue.z) }
+            ?.takeIf { hypot(it.x - surfaceVenue.x, it.z - surfaceVenue.z) < DUPLICATE_REFERENCE_M }
+            ?.let { "There is already a reference point here (“${it.name}”, %.0f cm away).".format(hypot(it.x - surfaceVenue.x, it.z - surfaceVenue.z) * 100f) }
+        val problems = listOfNotNull(problem, duplicate).joinToString("\n").ifEmpty { null }
+        android.util.Log.i(
+            ACCURACY_TAG,
+            "Reference capture: depth=%.2f m width=%.2f m facing=%.1f° venue=(%.2f, %.2f, %.2f) corners=%s detail=%d accepted=%b sign±%.1f cm/%.1f° problem=%s".format(
+                centerDepth, physicalWidth, facing, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z,
+                cornerDepths.map { it?.let { d -> "%.2f".format(d) } ?: "-" }, detail, accepted,
+                filter.spreadCm, filter.spreadDegrees, problems,
+            ),
+        )
+        return RefCapture(bitmap, physicalWidth, level, surfaceVenue.x, surfaceVenue.y, surfaceVenue.z, facing, detail, accepted, distance, problems)
     }
 
     fun captureReferencePoint(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
-        if (hadSavedMap && !filter.isLockedIn) {
+        if (frame.camera.trackingState != TrackingState.TRACKING) {
+            showToast("Tracking isn't stable yet. Hold still for a moment, then tap ◎ again.", 3_000)
+            return
+        }
+        if (!onMap()) {
             showToast(NOT_ON_MAP_YET, 4_500)
             return
         }
@@ -612,7 +670,7 @@ fun WayFinderCaptureScreen(
 
     fun maybeAutoCapture(frame: com.google.ar.core.Frame, session: com.google.ar.core.Session) {
         if (!autoPoints) return
-        if (hadSavedMap && !filter.isLockedIn) return
+        if (!onMap()) return
         if (recorder.progress - lastAutoProgress[0] < AUTO_INTERVAL_M) return
         lastAutoProgress[0] = recorder.progress
         val ref = grabReference(frame, session) ?: return
@@ -630,7 +688,7 @@ fun WayFinderCaptureScreen(
     }
 
     fun startWithoutSign() {
-        if (hadSavedMap && !filter.isLockedIn) {
+        if (!onMap()) {
             // Starting a new origin here would put everything recorded now out of line with the saved map.
             showToast(NOT_ON_MAP_YET, 4_500)
             return
@@ -1028,6 +1086,8 @@ fun WayFinderCaptureScreen(
                     val since = lostSince ?: now.also { lostSince = it }
                     if (now - since > TRACKING_LOST_RESET_MS && filter.isAligned) {
                         commit()
+                        mapFrameLost[0] = true
+                        android.util.Log.w(ACCURACY_TAG, "Tracking lost for over ${TRACKING_LOST_RESET_MS} ms: recorded data committed, map must be found again")
                         filter.reset()
                         visits.clear()
                         lockedIn = false
@@ -1059,6 +1119,13 @@ fun WayFinderCaptureScreen(
                     if (filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, viewpoint, countAsClose = isCapturedRef)) {
                         alignment = filter.alignment
                     }
+                    android.util.Log.d(
+                        ACCURACY_TAG,
+                        "Sighting ${sighting.marker.id}: %.2f m, cos %.2f -> spread ±%.1f cm/%.1f°, %d outliers, locked=%b".format(
+                            sighting.distanceMeters, sighting.viewCosine, filter.spreadCm, filter.spreadDegrees,
+                            filter.rejectedSightings, filter.isLockedIn,
+                        ),
+                    )
                     if (isBootstrap || isCapturedRef) {
                         startMarker = sighting.marker
                     }
@@ -1081,6 +1148,7 @@ fun WayFinderCaptureScreen(
                 if (agreement != signAgreement) signAgreement = agreement
                 lockProgress = filter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)
                 lockedIn = filter.isLockedIn
+                stable.update(session, filter.alignment, onMap(), frame.timestamp)
 
                 if (message == null && frameCounter[0] % 2 == 0) {
                     val here = Vec3(camera[0], camera[1], camera[2])
@@ -1147,16 +1215,16 @@ fun WayFinderCaptureScreen(
                     level = activeRoute?.levels?.firstOrNull() ?: routeDest.level.ifEmpty { defaultLevel },
                     venue = venue,
                     destination = routeDest,
-                    alignment = alignment,
+                    alignment = stable.display,
                     cameraPosition = cameraPosition,
                 )
             }
             // Saved objects and reference points are drawn in the map's frame, so only once this session knows where the
             // map is (before that they would appear in arbitrary places). Session objects live in the session frame.
-            if (lockedIn || !hadSavedMap) {
-                ObjectsScene(allVenueObjects, alignment, cameraPosition)
+            if (stable.ready) {
+                ObjectsScene(allVenueObjects, stable.display, cameraPosition)
                 // Render all reference points (saved + captured this session) with BLUE pins and BLUE text labels
-                ReferencePointsScene(allRefPins, alignment, cameraPosition)
+                ReferencePointsScene(allRefPins, stable.display, cameraPosition)
             }
             ObjectsScene(sessionObjects.toList(), Mat4.IDENTITY, cameraPosition)
         }

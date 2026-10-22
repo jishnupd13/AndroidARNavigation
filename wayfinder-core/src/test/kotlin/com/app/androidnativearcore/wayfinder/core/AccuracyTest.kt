@@ -178,3 +178,36 @@ class SurfaceChoiceTest {
         assertNull(SurfaceChoice.choose(emptyList()))
     }
 }
+
+class AlignmentSmootherTest {
+    private val start = Mat4.yaw(10f, Vec3(2f, 0f, 3f))
+
+    @Test
+    fun theFirstAlignmentIsShownAtOnce() {
+        val smoother = AlignmentSmoother()
+        assertEquals(2f, smoother.step(start, 0.016f).translation.x, 1e-5f)
+    }
+
+    @Test
+    fun aSmallCorrectionGlidesInsteadOfJumping() {
+        val smoother = AlignmentSmoother(timeConstantSeconds = 0.15f)
+        smoother.step(start, 0.016f)
+        val corrected = Mat4.yaw(10.5f, Vec3(2.02f, 0f, 3f)) // a 2 cm, half-degree correction
+        val afterOneFrame = smoother.step(corrected, 0.016f)
+        val moved = afterOneFrame.translation.x - 2f
+        assertTrue("moved a little on the first frame ($moved)", moved > 0f && moved < 0.005f)
+        // After about a second it has arrived.
+        var shown = afterOneFrame
+        repeat(60) { shown = smoother.step(corrected, 0.016f) }
+        assertEquals(2.02f, shown.translation.x, 1e-3f)
+        assertEquals(10.5f, yawDegreesOf(shown), 0.05f)
+    }
+
+    @Test
+    fun aLargeChangeIsAppliedAtOnce() {
+        val smoother = AlignmentSmoother()
+        smoother.step(start, 0.016f)
+        val relocalized = Mat4.yaw(40f, Vec3(5f, 0f, 3f))
+        assertEquals(5f, smoother.step(relocalized, 0.016f).translation.x, 1e-5f)
+    }
+}

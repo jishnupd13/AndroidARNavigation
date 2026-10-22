@@ -162,9 +162,14 @@ fun WayFinderNavigationScreen(
 
     // Keep the screen awake while navigating
     val view = LocalView.current
+    // The map alignment as drawn: anchored to the real world and changed smoothly (see StableAlignment).
+    val stable = remember { StableAlignment() }
     DisposableEffect(view) {
         view.keepScreenOn = true
-        onDispose { view.keepScreenOn = false }
+        onDispose {
+            view.keepScreenOn = false
+            stable.release()
+        }
     }
     BackHandler { controller.finish() }
 
@@ -178,7 +183,7 @@ fun WayFinderNavigationScreen(
                     controller.showToast("AR sign “${marker.name.resolved()}” can't be used: $reason", 6_000)
                 }
             },
-            onSessionUpdated = { _, frame ->
+            onSessionUpdated = { session, frame ->
                 val now = frame.timestamp / 1_000_000
                 for (sighting in markerTracker.sightings(frame, now, if (controller.isLockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else 300L)) {
                     controller.onMarkerDetected(sighting.marker, sighting.markerInSession, sighting.distanceMeters, sighting.cameraInSession, sighting.viewCosine)
@@ -186,31 +191,35 @@ fun WayFinderNavigationScreen(
                 val matrix = FloatArray(16)
                 frame.camera.pose.toMatrix(matrix, 0)
                 controller.onFrame(Mat4(matrix), ArMarkerTracker.trackingMessage(frame))
+                stable.update(session, controller.alignment, controller.isLockedIn, frame.timestamp)
             },
             onSessionFailed = { error -> controller.showToast("AR isn't available: ${error.message}", 8_000) },
         ) {
             val camPosProvider = { controller.cameraSessionPosition.let { Position(it.x, it.y, it.z) } }
-            RouteScene(
-                route = state.route,
-                level = state.renderedLevel,
-                venue = pkg.venue,
-                destination = activeDestination,
-                alignment = controller.alignment,
-                cameraPosition = camPosProvider,
-                languages = languages,
-            )
-            // Render ALL placed objects in the room so the user sees them in the live video as on the map
-            ObjectsScene(
-                objects = placedObjects,
-                alignment = controller.alignment,
-                cameraPosition = camPosProvider,
-            )
-            // Render ALL reference points with blue pins and blue text labels in the live video
-            ReferencePointsScene(
-                points = refPins,
-                alignment = controller.alignment,
-                cameraPosition = camPosProvider,
-            )
+            // Nothing is drawn until the map is found: before that, venue positions would land in arbitrary places.
+            if (stable.ready) {
+                RouteScene(
+                    route = state.route,
+                    level = state.renderedLevel,
+                    venue = pkg.venue,
+                    destination = activeDestination,
+                    alignment = stable.display,
+                    cameraPosition = camPosProvider,
+                    languages = languages,
+                )
+                // Render ALL placed objects in the room so the user sees them in the live video as on the map
+                ObjectsScene(
+                    objects = placedObjects,
+                    alignment = stable.display,
+                    cameraPosition = camPosProvider,
+                )
+                // Render ALL reference points with blue pins and blue text labels in the live video
+                ReferencePointsScene(
+                    points = refPins,
+                    alignment = stable.display,
+                    cameraPosition = camPosProvider,
+                )
+            }
         }
 
         Column(

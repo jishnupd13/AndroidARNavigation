@@ -181,6 +181,13 @@ class NavigationController(
             candidate, distanceMeters, viewCosine, if (isCapturedRef) null else cameraInSession, countAsClose = isCapturedRef,
         )
         if (changed) alignment = alignmentFilter.alignment
+        android.util.Log.d(
+            ACCURACY_TAG,
+            "Sighting ${marker.id}: %.2f m, cos %.2f -> spread ±%.1f cm/%.1f°, %d outliers, locked=%b".format(
+                distanceMeters, viewCosine, alignmentFilter.spreadCm, alignmentFilter.spreadDegrees,
+                alignmentFilter.rejectedSightings, alignmentFilter.isLockedIn,
+            ),
+        )
         // The first sighting can come from several meters away, where a sign's pose is least precise. Wait for a few
         // close-up ones before drawing anything, so everything starts out accurately placed.
         if (!alignmentFilter.isLockedIn) {
