@@ -69,8 +69,17 @@ class WalkedPathRouter(
     /** Straight-line tolerance when simplifying the route; small, so the route stays on the walked line. */
     var simplifyTolerance: Float = 0.1f,
 ) {
-    /** Route from [start] to [goal] through walked points only. */
-    fun route(start: Vec3, goal: Vec3, along: List<WalkedPoint>): WalkedRouteResult {
+    /**
+     * Route from [start] to [goal] through walked points only. [startJoins] and [goalJoins] limit which walked
+     * points the start and the goal may join (for example only the walk an object was placed from); by default any.
+     */
+    fun route(
+        start: Vec3,
+        goal: Vec3,
+        along: List<WalkedPoint>,
+        startJoins: (WalkedPoint) -> Boolean = { true },
+        goalJoins: (WalkedPoint) -> Boolean = { true },
+    ): WalkedRouteResult {
         if (along.isEmpty()) return WalkedRouteResult.Failure(WalkedRouteError.START_NOT_ON_PATH)
 
         val positions = along.map { it.position } + start + goal
@@ -111,10 +120,10 @@ class WalkedPathRouter(
         }
 
         // Join the start and the destination to nearby walked points (never to each other directly).
-        if (!joinToPath(startIndex, startJoinDistance, positions, along.size, ::link)) {
+        if (!joinToPath(startIndex, startJoinDistance, positions, along.indices.filter { startJoins(along[it]) }, ::link)) {
             return WalkedRouteResult.Failure(WalkedRouteError.START_NOT_ON_PATH)
         }
-        if (!joinToPath(goalIndex, destinationJoinDistance, positions, along.size, ::link)) {
+        if (!joinToPath(goalIndex, destinationJoinDistance, positions, along.indices.filter { goalJoins(along[it]) }, ::link)) {
             return WalkedRouteResult.Failure(WalkedRouteError.DESTINATION_NOT_ON_PATH)
         }
 
@@ -123,8 +132,8 @@ class WalkedPathRouter(
         return WalkedRouteResult.Success(simplify(indices.map { positions[it] }))
     }
 
-    private fun joinToPath(index: Int, maxDistance: Float, positions: List<Vec3>, pathCount: Int, link: (Int, Int) -> Unit): Boolean {
-        val distances = (0 until pathCount).map { it to horizontalDistance(positions[index], positions[it]) }
+    private fun joinToPath(index: Int, maxDistance: Float, positions: List<Vec3>, candidates: List<Int>, link: (Int, Int) -> Unit): Boolean {
+        val distances = candidates.map { it to horizontalDistance(positions[index], positions[it]) }
         val nearest = distances.minByOrNull { it.second } ?: return false
         if (nearest.second > maxDistance) return false
         // Only points about as close as the nearest one: the nearest points are almost always on the user's side

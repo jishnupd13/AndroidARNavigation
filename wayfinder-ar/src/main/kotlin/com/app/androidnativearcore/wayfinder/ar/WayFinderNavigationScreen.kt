@@ -88,8 +88,8 @@ fun WayFinderNavigationScreen(
             node = "",
         )
 
-    val controller = remember(pkg, profile, walkedPoints) {
-        NavigationController(pkg, initialDest, profile, listener, languages, walkedPoints, recordedFromMarkerId)
+    val controller = remember(pkg, profile, walkedPoints, placedObjects) {
+        NavigationController(pkg, initialDest, profile, listener, languages, walkedPoints, recordedFromMarkerId, placedObjects)
     }
     controller.listener = listener
     LaunchedEffect(destinationId) {
@@ -265,21 +265,26 @@ fun WayFinderNavigationScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        val distText = userPos?.let {
-                            " · %.1f m".format(hypot(activeDestination.x - it.x, activeDestination.z - it.z))
-                        }.orEmpty()
+                        // The walking distance along the route (not the straight line, which may cross walls).
+                        val distText = state.route?.let { " · %.0f m walk".format(it.length) }.orEmpty()
                         val glyph = when {
                             activeDestination.id.startsWith("objpoi-") -> ""
                             activeDestination.category == REFERENCE_CATEGORY -> "📍 "
                             activeDestination.category == CustomDestination.CATEGORY -> "⭐ "
                             else -> "🏁 "
                         }
-                        Text(
-                            "Navigate to: $glyph${activeDestination.name.resolved()}$distText",
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Navigate to: $glyph${activeDestination.name.resolved()}$distText",
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            // The shortest route found: where it starts, its length and the reference points on the way.
+                            if (state.route != null && controller.lastRouteSummary.isNotEmpty()) {
+                                Text(controller.lastRouteSummary, color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp)
+                            }
+                        }
                         Text("▾", color = Color(0xFF0A84FF), fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     }
 

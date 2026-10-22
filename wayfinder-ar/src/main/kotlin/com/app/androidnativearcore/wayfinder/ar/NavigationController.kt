@@ -4,7 +4,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.app.androidnativearcore.wayfinder.core.AlignmentFilter
+import com.app.androidnativearcore.wayfinder.core.ConnectionRoutePlanner
+import com.app.androidnativearcore.wayfinder.core.ConnectionRouteResult
 import com.app.androidnativearcore.wayfinder.core.CustomDestination
+import com.app.androidnativearcore.wayfinder.core.PlacedObject
+import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
+import com.app.androidnativearcore.wayfinder.core.RouteEndpoint
 import com.app.androidnativearcore.wayfinder.core.followsWalkedPaths
 import com.app.androidnativearcore.wayfinder.core.MarkerAlignment
 import com.app.androidnativearcore.wayfinder.core.Mat4
@@ -19,9 +24,7 @@ import com.app.androidnativearcore.wayfinder.core.Vec2
 import com.app.androidnativearcore.wayfinder.core.Vec3
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
-import com.app.androidnativearcore.wayfinder.core.WalkedPathRouter
 import com.app.androidnativearcore.wayfinder.core.WalkedPoint
-import com.app.androidnativearcore.wayfinder.core.WalkedRouteResult
 
 /** Something a user reported from the navigation screen ("route blocked", "marker missing"…). */
 data class NavigationFeedback(
@@ -97,6 +100,8 @@ class NavigationController(
     private val walkedPoints: List<WalkedPoint> = emptyList(),
     /** The sign this destination's path was recorded from, if known; scanning another one is less accurate. */
     private val recordedFromMarkerId: String = "",
+    /** Objects placed while recording: an object chosen as destination is joined to the walk it was placed from. */
+    private val placedObjects: List<PlacedObject> = emptyList(),
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val venue: Venue get() = pkg.venue
@@ -109,6 +114,10 @@ class NavigationController(
 
     /** The most recently recognized reference point / sign. */
     var lastAlignedMarker: Venue.Marker? by mutableStateOf(null)
+        private set
+
+    /** The latest route found, for the screen: "RP1 → Conference Room: 23 m via RP2 → RP3". Empty without one. */
+    var lastRouteSummary: String by mutableStateOf("")
         private set
 
     var uiState by mutableStateOf(NavigationUiState())
@@ -327,7 +336,8 @@ class NavigationController(
         needsRoute = false
         try {
             val route = if (destination.followsWalkedPaths) {
-                planWalkedRoute(position, level)
+                // The first route starts at the reference point the user was located at; a re-route from where they are.
+                planWalkedRoute(position, level, fromReference = !rerouted)
             } else {
                 planner.route(position, level, toPOI = destination.id, profile = profile)
             }
@@ -340,43 +350,83 @@ class NavigationController(
             uiState = uiState.copy(route = route, renderedLevel = renderedLvl, banner = uiState.banner ?: placeholderBanner())
             listener?.onRoutePlanned(route, rerouted)
         } catch (e: Exception) {
-            uiState = uiState.copy(banner = GuidanceBanner("No route found", "⚠", e.message ?: "No route found."))
+            val message = e.message ?: "No route found."
+            android.util.Log.w(ROUTE_TAG, "No route to ${destination.id}: $message")
+            if (rerouted && uiState.route != null) {
+                // Off the recorded path: keep showing the route found earlier and say how to get back to it.
+                uiState = uiState.copy(banner = GuidanceBanner("Go back to the path", "⚠", message))
+            } else {
+                // Nothing valid to show: no route is drawn rather than a line through walls.
+                tracker = null
+                lastRouteSummary = ""
+                uiState = uiState.copy(route = null, banner = GuidanceBanner("No route found", "⚠", message))
+            }
         }
     }
 
-    /** Routes along the walked path (port of the iOS prototype's `WalkedPathController.planRoute`). */
-    private fun planWalkedRoute(position: Vec3, level: String): Route {
+    /** Captured reference points, reported when a route passes them ("via RP2, RP3"). */
+    private val referenceLandmarks: List<Pair<String, Vec3>> by lazy {
+        venue.markers.filter { it.id.startsWith("ref-") }.map { resolve(it.name) to Vec3(it.x, it.y, it.z) }
+    }
+
+    /**
+     * The shortest route along the recorded walks ([ConnectionRoutePlanner]): from the reference point the user was
+     * located at ([fromReference], while they are still near it) or else from their position, to the destination.
+     * With no recorded connection, this throws: a clear message is shown instead of a line drawn through walls.
+     */
+    private fun planWalkedRoute(position: Vec3, level: String, fromReference: Boolean): Route {
         val targetLevel = destination.level.ifEmpty { level }
-        val floor = destination.elevation ?: venue.level(targetLevel)?.elevation ?: (position.y - 1.4f)
-        val start = Vec3(position.x, floor, position.z)
-        val goal = Vec3(destination.x, floor, destination.z)
-        val points = walkedPoints.filter { it.level == targetLevel }.ifEmpty { walkedPoints }
-        val router = WalkedPathRouter(startJoinDistance = 12f, destinationJoinDistance = 12f)
-        return when (val result = router.route(start, goal, points)) {
-            is WalkedRouteResult.Success -> planner.routeAlong(result.points, targetLevel, profile)
-            is WalkedRouteResult.Failure -> {
-                // If there are recorded path points leading to this destination, follow them from the closest point!
-                val matchingRun = points.filter { it.destinationId == destination.id }.sortedBy { it.sequence }
-                    .ifEmpty {
-                        // Or find the run whose end is closest to the goal
-                        points.groupBy { it.run }.values
-                            .map { run -> run.sortedBy { it.sequence } }
-                            .minByOrNull { run -> run.last().position.distanceTo(goal) }
-                            ?.takeIf { run -> run.last().position.distanceTo(goal) <= 5f }
-                            .orEmpty()
-                    }
-                if (matchingRun.size >= 2) {
-                    val closestIdx = matchingRun.indices.minByOrNull { matchingRun[it].position.distanceTo(start) } ?: 0
-                    val lead = com.app.androidnativearcore.wayfinder.core.straightWalk(
-                        start, matchingRun[closestIdx].position, "lead", targetLevel, floor,
-                    ).map { it.position }
-                    val tail = matchingRun.drop(closestIdx).map { Vec3(it.x, floor, it.z) } + goal
-                    planner.routeAlong((lead + tail).distinct(), targetLevel, profile)
-                } else {
-                    val direct = com.app.androidnativearcore.wayfinder.core.straightWalk(start, goal, "direct", targetLevel, floor).map { it.position } + goal
-                    planner.routeAlong(direct, targetLevel, profile)
-                }
+        val connections = ConnectionRoutePlanner(walkedPoints, referenceLandmarks)
+        val goal = destinationEndpoint(targetLevel)
+        val fromPosition = RouteEndpoint("your position", position, targetLevel, POSITION_JOIN_M)
+        val fromRef = lastAlignedMarker?.takeIf {
+            fromReference && (it.level == targetLevel || it.level.isEmpty()) &&
+                Vec2(it.x - position.x, it.z - position.z).length <= START_AT_REFERENCE_M
+        }?.let { RouteEndpoint(resolve(it.name), Vec3(it.x, position.y, it.z), targetLevel, REFERENCE_JOIN_M) }
+
+        var start = fromRef ?: fromPosition
+        var result = connections.route(start, goal)
+        if (fromRef != null && result is ConnectionRouteResult.Failure && result.reason == ConnectionRouteResult.Reason.START_NOT_CONNECTED) {
+            // The reference point itself isn't on a recorded walk: start from where the user stands instead.
+            start = fromPosition
+            result = connections.route(start, goal)
+        }
+        return when (result) {
+            is ConnectionRouteResult.Success -> {
+                android.util.Log.i(
+                    ROUTE_TAG,
+                    "Route ${start.name} → ${goal.name}: %.1f m, %d points, via %s".format(
+                        result.lengthMeters, result.points.size, result.via.ifEmpty { listOf("-") }.joinToString(" → "),
+                    ),
+                )
+                lastRouteSummary = "%s → %s: %s".format(
+                    start.name, goal.name, Instructions.distance(result.lengthMeters),
+                ) + if (result.via.isEmpty()) "" else " via ${result.via.joinToString(" → ")}"
+                planner.routeAlong(result.points, targetLevel, profile)
             }
+            is ConnectionRouteResult.Failure -> {
+                android.util.Log.w(ROUTE_TAG, "No route ${start.name} → ${goal.name}: ${result.reason}")
+                throw RoutingError.Other(result.reason.message)
+            }
+        }
+    }
+
+    /**
+     * Where the destination joins the recorded walks: an object joins the walk it was placed from (it was seen from
+     * there, so the last stretch is clear), a reference point the walks that lead to it, a saved destination the walk
+     * that was recorded to it.
+     */
+    private fun destinationEndpoint(level: String): RouteEndpoint {
+        val name = resolve(destination.name)
+        val position = Vec3(destination.x, destination.elevation ?: 0f, destination.z)
+        fun ownWalk(id: String?) = id?.takeIf { it.isNotEmpty() && walkedPoints.any { p -> p.destinationId == it } }
+        return when {
+            destination.id.startsWith(OBJECT_POI_PREFIX) -> {
+                val obj = placedObjects.firstOrNull { OBJECT_POI_PREFIX + it.id == destination.id }
+                RouteEndpoint(name, position, level, OBJECT_JOIN_M, ownWalk(obj?.destinationId))
+            }
+            destination.category == REFERENCE_CATEGORY -> RouteEndpoint(name, position, level, REFERENCE_JOIN_M)
+            else -> RouteEndpoint(name, position, level, DESTINATION_JOIN_M, ownWalk(destination.id))
         }
     }
 
@@ -450,6 +500,23 @@ class NavigationController(
     private companion object {
         /** How close (meters) the user must get to a destination they saved for it to count as reached. */
         const val CUSTOM_ARRIVAL_RADIUS_M = 1.0f
+
+        /** Log tag for route calculation. */
+        const val ROUTE_TAG = "WFRoute"
+
+        /** POI ids of placed objects listed as destinations start with this, followed by the object's id. */
+        const val OBJECT_POI_PREFIX = "objpoi-"
+
+        /** The first route starts at the located reference point while the user is within this many meters of it. */
+        const val START_AT_REFERENCE_M = 4f
+
+        /** How far (meters) each kind of route end may be from the recorded walk it joins. */
+        const val POSITION_JOIN_M = 3f
+        const val REFERENCE_JOIN_M = 3f
+        const val DESTINATION_JOIN_M = 1.5f
+
+        /** Objects are tapped from up to 6 m away, so they may sit that far from the walk they were placed from. */
+        const val OBJECT_JOIN_M = 6.5f
 
         /** How long (ms) the user must stay within the arrival radius before "You have arrived" appears. */
         const val ARRIVAL_DWELL_MS = 1_000L
