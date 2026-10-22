@@ -175,19 +175,11 @@ class NavigationController(
         }
         val candidate = MarkerAlignment.alignment(markerInSession, MarkerAlignment.transform(marker))
         // Sightings are blended in by distance (close-ups count more) and only applied when they move the alignment
-        // by a meaningful amount, so the scene doesn't jitter. Captured photo reference points lock in on first match.
-        val changed = if (isCapturedRef && !alignmentFilter.isLockedIn) {
-            var anyChanged = false
-            repeat(AlignmentFilter.LOCK_IN_SIGHTINGS) {
-                if (alignmentFilter.update(candidate, 1f, 1f, null)) anyChanged = true
-            }
-            anyChanged
-        } else {
-            val effectiveDistance = if (isCapturedRef) distanceMeters.coerceAtMost(AlignmentFilter.CLOSE_DISTANCE_M) else distanceMeters
-            val effectiveCosine = if (isCapturedRef) viewCosine.coerceAtLeast(AlignmentFilter.MIN_FRONTAL_COSINE) else viewCosine
-            val effectiveCamera = if (isCapturedRef) null else cameraInSession
-            alignmentFilter.update(candidate, effectiveDistance, effectiveCosine, effectiveCamera)
-        }
+        // by a meaningful amount, so the scene doesn't jitter. A captured photo reference point is weighted by its real
+        // distance and angle too, but locks in after two readings and without side-to-side movement.
+        val changed = alignmentFilter.update(
+            candidate, distanceMeters, viewCosine, if (isCapturedRef) null else cameraInSession, countAsClose = isCapturedRef,
+        )
         if (changed) alignment = alignmentFilter.alignment
         // The first sighting can come from several meters away, where a sign's pose is least precise. Wait for a few
         // close-up ones before drawing anything, so everything starts out accurately placed.

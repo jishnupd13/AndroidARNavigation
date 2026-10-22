@@ -31,6 +31,13 @@ object CameraImage {
         return Bitmap.createBitmap(bitmap, left, top, side, side)
     }
 
+    /** A centered crop [width] × [height] pixels (clamped to the bitmap). */
+    fun centerRect(bitmap: Bitmap, width: Float, height: Float): Bitmap {
+        val w = width.toInt().coerceIn(16, bitmap.width)
+        val h = height.toInt().coerceIn(16, bitmap.height)
+        return Bitmap.createBitmap(bitmap, (bitmap.width - w) / 2, (bitmap.height - h) / 2, w, h)
+    }
+
     fun rotate(bitmap: Bitmap, degrees: Int): Bitmap {
         if (degrees % 360 == 0) return bitmap
         val m = Matrix().apply { postRotate(degrees.toFloat()) }

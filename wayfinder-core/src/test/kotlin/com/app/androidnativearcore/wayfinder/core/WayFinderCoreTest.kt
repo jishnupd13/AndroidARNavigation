@@ -927,15 +927,16 @@ class SightingQualityTest {
 
     @Test
     fun obliqueSightingsCountForMuchLess() {
-        // Nine head-on sightings read the truth; one edge-on sighting reads 40 cm off. It barely moves the alignment...
+        // Three head-on sightings read the truth; one edge-on sighting reads 7 cm off (close enough not to be thrown
+        // out as an outlier). It barely moves the alignment...
         val withOblique = AlignmentFilter().apply {
-            repeat(5) { update(truth, 1f, viewCosine = 1f) }
-            update(Mat4.yaw(10f, Vec3(2.4f, 0f, 3f)), 1f, viewCosine = 0.25f)
+            repeat(3) { update(truth, 1f, viewCosine = 1f) }
+            update(Mat4.yaw(10f, Vec3(2.07f, 0f, 3f)), 1f, viewCosine = 0.25f)
         }
         // ...whereas counted like a head-on one, the same reading would have dragged it much further.
         val asIfHeadOn = AlignmentFilter().apply {
-            repeat(5) { update(truth, 1f, viewCosine = 1f) }
-            update(Mat4.yaw(10f, Vec3(2.4f, 0f, 3f)), 1f, viewCosine = 1f)
+            repeat(3) { update(truth, 1f, viewCosine = 1f) }
+            update(Mat4.yaw(10f, Vec3(2.07f, 0f, 3f)), 1f, viewCosine = 1f)
         }
         val errorOblique = kotlin.math.abs(withOblique.alignment.translation.x - 2f)
         val errorHeadOn = kotlin.math.abs(asIfHeadOn.alignment.translation.x - 2f)

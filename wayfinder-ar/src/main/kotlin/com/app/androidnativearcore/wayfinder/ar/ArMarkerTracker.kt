@@ -2,11 +2,14 @@ package com.app.androidnativearcore.wayfinder.ar
 
 import android.graphics.BitmapFactory
 import com.app.androidnativearcore.wayfinder.core.Mat4
+import com.app.androidnativearcore.wayfinder.core.SurfaceChoice
 import com.app.androidnativearcore.wayfinder.core.Vec3
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.VenuePackage
 import com.google.ar.core.AugmentedImage
 import com.google.ar.core.AugmentedImageDatabase
+import com.google.ar.core.CameraConfig
+import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
@@ -139,6 +142,24 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
     }
 
     /**
+     * The nearest measured surface point at screen position ([xPx], [yPx]) (a plane, a depth point or a feature point
+     * with a known surface), or null if ARCore has measured nothing there. Used to check how deep a scene is.
+     */
+    fun nearestSurfaceAt(frame: Frame, xPx: Float, yPx: Float, maxDistanceM: Float = 8f): Vec3? =
+        frame.hitTest(xPx, yPx)
+            .filter { hit ->
+                val trackable = hit.trackable
+                hit.distance <= maxDistanceM && when (trackable) {
+                    is Plane -> trackable.isPoseInPolygon(hit.hitPose)
+                    is DepthPoint -> true
+                    is Point -> trackable.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL
+                    else -> false
+                }
+            }
+            .minByOrNull { it.distance }
+            ?.hitPose?.let { Vec3(it.tx(), it.ty(), it.tz()) }
+
+    /**
      * Height of the real floor under the user in the session frame, from the horizontal planes ARCore has detected:
      * the lowest upward-facing plane 0.8–2.3 m below the camera and within 6 m of it (tables are higher; the
      * lowest remaining surface is the floor). Null when no such plane is known yet. Needs [configure] with
@@ -205,8 +226,11 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
 
         val atTap = frame.hitTest(xPx, yPx).filter(::usable)
         if (preferPlane) {
-            atTap.firstOrNull { it.trackable is Plane }?.let { plane ->
-                return SurfaceHit(position(plane.hitPose), isPlane = true) { plane.createAnchor() }
+            // A plane only if it is the surface tapped, not the floor plane far behind a tapped sofa (SurfaceChoice).
+            val chosen = SurfaceChoice.choose(atTap.map { SurfaceChoice.Candidate(it.distance, it.trackable is Plane) })
+                ?.let { atTap[it] }
+            if (chosen != null && chosen.trackable is Plane) {
+                return SurfaceHit(position(chosen.hitPose), isPlane = true) { chosen.createAnchor() }
             }
         } else {
             // When capturing a foreground object (e.g. a bottle on a table), pick the closest hit so we don't
@@ -226,6 +250,26 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
 
     companion object {
         const val REDETECT_INTERVAL_MS = 1_500L
+
+        /** Widest camera image (pixels) used for tracking; larger costs too much CPU on mid-range phones. */
+        private const val MAX_TRACKING_IMAGE_WIDTH = 1280
+
+        /**
+         * The camera configuration to start ARCore with: the sharpest CPU image up to [MAX_TRACKING_IMAGE_WIDTH] wide
+         * at 30 fps. ARCore finds and measures signs and reference photos in this image, and reference photos are cut
+         * from it; its default is often only 640×480. Twice the pixels across makes reference photos sharper and their
+         * measured pose (above all their facing) steadier. SceneView's own default (the highest resolution) can
+         * starve motion tracking on mid-range phones.
+         */
+        fun preferredCameraConfig(session: Session): CameraConfig {
+            val filter = CameraConfigFilter(session).setTargetFps(java.util.EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30))
+            val chosen = session.getSupportedCameraConfigs(filter)
+                .filter { it.imageSize.width <= MAX_TRACKING_IMAGE_WIDTH }
+                .maxByOrNull { it.imageSize.width * it.imageSize.height }
+                ?: session.cameraConfig
+            android.util.Log.i("WayFinder", "Camera config: CPU image ${chosen.imageSize}, GPU texture ${chosen.textureSize}")
+            return chosen
+        }
 
         /** A floor is between these distances below the phone (tables are higher; lower is a hole or noise). */
         const val FLOOR_MIN_BELOW_M = 0.5f

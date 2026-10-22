@@ -74,7 +74,7 @@ fun WayFinderLocateScreen(
     Box(modifier.fillMaxSize().background(Color.Black)) {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
-            sessionCameraConfig = null,
+            sessionCameraConfig = ArMarkerTracker::preferredCameraConfig,
             sessionConfiguration = { session, config ->
                 markerTracker.configure(session, config)
                 markerTracker.unusableMarkers.firstOrNull()?.let { (marker, reason) ->
@@ -92,15 +92,12 @@ fun WayFinderLocateScreen(
                     matched = sighting.marker
                     val candidate = MarkerAlignment.alignment(sighting.markerInSession, MarkerAlignment.transform(sighting.marker))
                     val isCapturedRef = sighting.marker.id.startsWith("ref-")
-                    if (isCapturedRef) {
-                        // Captured photo reference points can be harder for ARCore to hold in FULL_TRACKING across
-                        // multiple viewpoints; lock in immediately once ARCore recognizes the image.
-                        repeat(AlignmentFilter.LOCK_IN_SIGHTINGS) {
-                            filter.update(candidate, 1f, 1f, null)
-                        }
-                    } else {
-                        filter.update(candidate, sighting.distanceMeters, sighting.viewCosine, sighting.cameraInSession)
-                    }
+                    // Captured photo reference points are harder for ARCore to hold across viewpoints, so they lock in
+                    // after two readings without side-to-side movement; both are still weighted by real distance/angle.
+                    filter.update(
+                        candidate, sighting.distanceMeters, sighting.viewCosine,
+                        if (isCapturedRef) null else sighting.cameraInSession, countAsClose = isCapturedRef,
+                    )
                     progress = filter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)
                     if (filter.isLockedIn) {
                         val camera = frame.camera.pose

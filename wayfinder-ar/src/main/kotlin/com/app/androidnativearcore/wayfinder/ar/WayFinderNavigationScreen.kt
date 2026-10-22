@@ -171,7 +171,7 @@ fun WayFinderNavigationScreen(
     Box(modifier.fillMaxSize().background(Color.Black)) {
         ARSceneView(
             modifier = Modifier.fillMaxSize(),
-            sessionCameraConfig = null,
+            sessionCameraConfig = ArMarkerTracker::preferredCameraConfig,
             sessionConfiguration = { session, config ->
                 markerTracker.configure(session, config)
                 markerTracker.unusableMarkers.firstOrNull()?.let { (marker, reason) ->

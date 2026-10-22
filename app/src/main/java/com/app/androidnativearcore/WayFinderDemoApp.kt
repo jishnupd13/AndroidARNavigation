@@ -394,7 +394,6 @@ private fun DestinationListScreen(
     val admin = mode == AppMode.ADMIN
     val refMarkers = remember(venue.markers) { venue.markers.filter { it.id.startsWith("ref-") } }
     val customPois = remember(venue.pois) { venue.pois.filter { it.category == CustomDestination.CATEGORY } }
-    val userObjects = remember(placedObjects) { placedObjects.filter { !it.isReference } }
     val capturedCount = refMarkers.size
     var search by remember { mutableStateOf("") }
     var unsupported by remember { mutableStateOf(false) }
@@ -485,9 +484,9 @@ private fun DestinationListScreen(
                 item {
                     IosSection {
                         IosRow(
-                            title = "Connect reference points & objects",
+                            title = "Connect to a destination",
                             glyph = "🔗",
-                            subtitle = "Walk from one reference point to another ($capturedCount ref pts · ${userObjects.size} objects)",
+                            subtitle = "Walk from a reference point to a destination ($capturedCount ref pts · ${customPois.size} destinations)",
                             onClick = { showConnectDialog = true },
                         )
                         IosRowDivider()
@@ -501,31 +500,12 @@ private fun DestinationListScreen(
                         )
                     }
                 }
-                if (refMarkers.isNotEmpty() || customPois.isNotEmpty() || userObjects.isNotEmpty()) {
+                // Admin sees only the destinations here; reference points and objects are not listed.
+                if (customPois.isNotEmpty()) {
                     item {
-                        IosSection(title = "Reference points, destinations & objects (walk & connect)") {
+                        IosSection(title = "Destinations (walk & connect)") {
                             val fromMarker = refMarkers.firstOrNull { it.id == selectedFromRefId } ?: refMarkers.firstOrNull()
                             val fromLabel = fromMarker?.name?.resolved() ?: "Start point"
-                            refMarkers.forEachIndexed { idx, marker ->
-                                val isStart = marker.id == fromMarker?.id
-                                IosRow(
-                                    title = "📍 ${marker.name.resolved()}",
-                                    glyph = "🔗",
-                                    subtitle = if (isStart) {
-                                        "Selected as Start (From) · Tap to pick target to connect"
-                                    } else {
-                                        "Tap to walk & connect from 📍 $fromLabel → 📍 ${marker.name.resolved()}"
-                                    },
-                                    onClick = {
-                                        if (isStart && refMarkers.size + customPois.size + userObjects.size > 1) {
-                                            showConnectDialog = true
-                                        } else {
-                                            onWalkAndConnect(fromMarker?.id, marker.id)
-                                        }
-                                    },
-                                )
-                                if (idx < refMarkers.lastIndex || customPois.isNotEmpty() || userObjects.isNotEmpty()) IosRowDivider()
-                            }
                             customPois.forEachIndexed { idx, poi ->
                                 IosRow(
                                     title = "⭐ ${poi.name.resolved()}",
@@ -535,19 +515,7 @@ private fun DestinationListScreen(
                                         onWalkAndConnect(fromMarker?.id, poi.id)
                                     },
                                 )
-                                if (idx < customPois.lastIndex || userObjects.isNotEmpty()) IosRowDivider()
-                            }
-                            userObjects.forEachIndexed { idx, obj ->
-                                val label = obj.text.ifBlank { obj.kind.label }
-                                IosRow(
-                                    title = "${obj.kind.glyph} $label",
-                                    glyph = "🔗",
-                                    subtitle = "Tap to walk & connect from 📍 $fromLabel → ${obj.kind.glyph} $label",
-                                    onClick = {
-                                        onWalkAndConnect(fromMarker?.id, obj.id)
-                                    },
-                                )
-                                if (idx < userObjects.lastIndex) IosRowDivider()
+                                if (idx < customPois.lastIndex) IosRowDivider()
                             }
                         }
                     }
@@ -592,8 +560,9 @@ private fun DestinationListScreen(
             }
 
             for (level in venue.levels) {
+                // Reference points are not listed here (only real destinations); a floor with none left is hidden.
                 val pois = venue.pois
-                    .filter { it.level == level.id }
+                    .filter { it.level == level.id && it.category != REFERENCE_CATEGORY }
                     .filter {
                         search.isEmpty() || it.name.resolved().contains(search, ignoreCase = true) ||
                             it.category.contains(search, ignoreCase = true)
@@ -631,7 +600,7 @@ private fun DestinationListScreen(
     if (showConnectDialog) {
         AlertDialog(
             onDismissRequest = { showConnectDialog = false },
-            title = { Text("Walk & Connect Reference Points / Objects") },
+            title = { Text("Walk & Connect to a Destination") },
             text = {
                 Column(
                     Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState()),
@@ -677,49 +646,19 @@ private fun DestinationListScreen(
                     }
 
                     Text(
-                        "2. Tap Target Destination, Reference Point, or Object to Walk & Connect To:",
+                        "2. Tap the Destination to Walk & Connect To:",
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp,
                         modifier = Modifier.padding(top = 4.dp),
                     )
                     val fromName = refMarkers.firstOrNull { it.id == selectedFromRefId }?.name?.resolved() ?: "Start point"
-                    val targetRefs = refMarkers.filter { it.id != selectedFromRefId || refMarkers.size == 1 }
-                    if (targetRefs.isEmpty() && customPois.isEmpty() && userObjects.isEmpty()) {
+                    if (customPois.isEmpty()) {
                         Text(
-                            "Tap 'Open Camera' below to capture more reference points or place 3D objects and connect them.",
+                            "No destinations yet. Tap Add destination to record one.",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     } else {
-                        targetRefs.forEach { target ->
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0x1834C759))
-                                    .clickable {
-                                        showConnectDialog = false
-                                        onWalkAndConnect(selectedFromRefId, target.id)
-                                    }
-                                    .padding(horizontal = 10.dp, vertical = 10.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        "📍 ${target.name.resolved()}",
-                                        color = Color(0xFF0A84FF),
-                                        fontWeight = FontWeight.SemiBold,
-                                    )
-                                    Text(
-                                        "Walk from 📍 $fromName → 📍 ${target.name.resolved()}",
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
-                        }
                         customPois.forEach { poi ->
                             Row(
                                 Modifier
@@ -749,35 +688,6 @@ private fun DestinationListScreen(
                                 Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
                             }
                         }
-                        userObjects.forEach { obj ->
-                            val label = obj.text.ifBlank { obj.kind.label }
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0x1834C759))
-                                    .clickable {
-                                        showConnectDialog = false
-                                        onWalkAndConnect(selectedFromRefId, obj.id)
-                                    }
-                                    .padding(horizontal = 10.dp, vertical = 10.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        "${obj.kind.glyph} $label",
-                                        fontWeight = FontWeight.SemiBold,
-                                    )
-                                    Text(
-                                        "Walk from 📍 $fromName → ${obj.kind.glyph} $label",
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                                Text("🔗 Walk & Connect", color = Color(0xFF34C759), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
-                        }
                     }
                 }
             },
@@ -785,9 +695,8 @@ private fun DestinationListScreen(
                 TextButton(
                     onClick = {
                         showConnectDialog = false
-                        val defaultTarget = refMarkers.firstOrNull { it.id != selectedFromRefId }?.id
-                            ?: customPois.firstOrNull()?.id
-                            ?: userObjects.firstOrNull()?.id
+                        val defaultTarget = customPois.firstOrNull()?.id
+                            ?: refMarkers.firstOrNull { it.id != selectedFromRefId }?.id
                         onWalkAndConnect(selectedFromRefId, defaultTarget)
                     },
                 ) { Text("Open Camera") }
