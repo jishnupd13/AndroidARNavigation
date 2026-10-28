@@ -123,12 +123,16 @@ private object DemoVenue {
     }
 }
 
+/**
+ * The demo app. [incomingBundle] is a saved data bundle (.zip) the app was opened with from a file manager or shared
+ * to; the user is asked before it is imported, and [onIncomingHandled] is called once that is settled.
+ */
 @Composable
-fun WayFinderDemoApp() {
+fun WayFinderDemoApp(incomingBundle: Uri? = null, onIncomingHandled: () -> Unit = {}) {
     val context = LocalContext.current
     val venue = remember { DemoVenue.load(context) }
     venue.fold(
-        onSuccess = { WayFinderHost(it) },
+        onSuccess = { WayFinderHost(it, incomingBundle, onIncomingHandled) },
         onFailure = {
             Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
                 Text("Venue data can't be loaded", style = MaterialTheme.typography.titleMedium)
@@ -139,7 +143,7 @@ fun WayFinderDemoApp() {
 }
 
 @Composable
-private fun WayFinderHost(basePackage: VenuePackage) {
+private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onIncomingHandled: () -> Unit) {
     val context = LocalContext.current
     // Every path the user recorded is its own JSON file in `paths/`: the destination, the walk to it and the objects
     // along it. Destinations show up in the list as ordinary POIs.
@@ -150,12 +154,46 @@ private fun WayFinderHost(basePackage: VenuePackage) {
     var paths by remember { mutableStateOf(store.load(basePackage.venue.id)) }
     var extraMarkers by remember { mutableStateOf(markerStore.load(basePackage.venue.id)) }
     val customDestinations = paths.map { it.destination }
-    val pkg = remember(basePackage, customDestinations, extraMarkers) {
+    val pkg = remember(basePackage, customDestinations, extraMarkers, paths) {
+        // The bundled demo signs are placed in the demo mall's own map. Once this phone has its own map (reference
+        // points captured here or imported), a demo sign that no saved path was recorded from would put the user at
+        // a demo-mall position, unrelated to their paths ("your starting point isn't on any recorded path"), so
+        // only the demo signs that a path actually starts from are kept.
+        val usedSigns = paths.map { it.startMarkerId }.toSet()
+        val signs = if (extraMarkers.isEmpty()) basePackage.venue.markers else basePackage.venue.markers.filter { it.id in usedSigns }
         basePackage.withVenue(
-            basePackage.venue.withCustomDestinations(customDestinations).withExtraMarkers(extraMarkers)
+            basePackage.venue.copy(markers = signs).withCustomDestinations(customDestinations).withExtraMarkers(extraMarkers)
                 .withReferenceDestinations(extraMarkers),
         )
     }
+    // A bundle opened from a file manager or shared to the app: imported only after the user agrees, since it merges
+    // into (and can replace) what is saved on this phone.
+    var importResult by remember { mutableStateOf<String?>(null) }
+    if (incomingBundle != null) {
+        AlertDialog(
+            onDismissRequest = onIncomingHandled,
+            title = { Text("Import data?") },
+            text = { Text("Add the paths and reference points in this file to this phone? Ones with the same name are replaced.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    importResult = DataTransfer.importWithSummary(context, incomingBundle, basePackage.venue.id)
+                    paths = store.load(basePackage.venue.id)
+                    extraMarkers = markerStore.load(basePackage.venue.id)
+                    onIncomingHandled()
+                }) { Text("Import") }
+            },
+            dismissButton = { TextButton(onClick = onIncomingHandled) { Text("Cancel") } },
+        )
+    }
+    importResult?.let { message ->
+        AlertDialog(
+            onDismissRequest = { importResult = null },
+            title = { Text("Data") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { importResult = null }) { Text("OK") } },
+        )
+    }
+
     // Every walk joined together: from any reference point, routes can follow any path walked from the entry.
     val allWalkedPoints = remember(paths) { paths.flatMap { it.walkedPoints } }
     val allPlacedObjects = remember(paths) { paths.flatMap { it.objects } }
@@ -163,15 +201,9 @@ private fun WayFinderHost(basePackage: VenuePackage) {
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     var stepFree by remember { mutableStateOf(false) }
 
+    /** The camera button: the scan screen, which recognizes a reference point first and then lists what is near. */
     fun openLiveCamera() {
-        val firstPoi = pkg.venue.pois.firstOrNull { it.category == CustomDestination.CATEGORY }
-            ?: pkg.venue.pois.firstOrNull { it.category == REFERENCE_CATEGORY }
-            ?: pkg.venue.pois.firstOrNull()
-        if (firstPoi != null) {
-            screen = Screen.Navigate(firstPoi, if (stepFree) RouteProfile.STEP_FREE else RouteProfile.FASTEST)
-        } else {
-            screen = Screen.Locate
-        }
+        screen = Screen.Locate
     }
 
     when (val current = screen) {
@@ -363,7 +395,12 @@ private fun WayFinderHost(basePackage: VenuePackage) {
                 listener = listener,
                 walkedPoints = allWalkedPoints,
                 placedObjects = allPlacedObjects,
-                recordedFromMarkerId = "",
+                // The reference point or sign this destination's path was recorded from: navigation then trusts only
+                // that one (and other reference points of the same map), not an unrelated sign.
+                recordedFromMarkerId = paths.firstOrNull { path ->
+                    path.destination.id == current.poi.id || path.objects.any { "objpoi-${it.id}" == current.poi.id }
+                }?.startMarkerId.orEmpty(),
+                guideMarkerId = current.from?.marker?.id.orEmpty(),
                 debug = true,
             )
         }
@@ -406,9 +443,8 @@ private fun DestinationListScreen(
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            val count = runCatching { DataTransfer.import(context, uri, context.filesDir) }.getOrElse { -1 }
+            transferMsg = DataTransfer.importWithSummary(context, uri, venue.id)
             onDataChanged()
-            transferMsg = if (count >= 0) "Loaded $count file(s) from the selected bundle." else "Couldn't read that file."
         }
     }
 

@@ -38,7 +38,9 @@ data class ArPath(
  * never overwritten.
  */
 class ArPathStore(private val directory: File) {
-    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    // coerceInputValues: a `null` another app wrote for a value with a default here (such as "startMarkerId" in the
+    // iOS app's export) reads as that default; without it the whole path file was skipped as unreadable.
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true; coerceInputValues = true }
 
     private class Entry(val file: File, val path: ArPath)
 

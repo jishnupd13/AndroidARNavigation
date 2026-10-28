@@ -4,6 +4,9 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
+import com.app.androidnativearcore.wayfinder.core.ArPathStore
+import com.app.androidnativearcore.wayfinder.core.CapturedMarkerStore
+import com.app.androidnativearcore.wayfinder.core.DataBundle
 import java.io.File
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
@@ -44,7 +47,8 @@ object DataTransfer {
 
     /**
      * Extracts a zip picked by the user into [targetParent] (merging with what's there), so its `paths/` and
-     * `captured-markers/` folders land back in the app's files dir. Returns the number of files written.
+     * `captured-markers/` folders land back in the app's files dir, wherever they are inside the zip (see
+     * [DataBundle]). Returns the number of files written.
      */
     fun import(context: Context, uri: Uri, targetParent: File): Int {
         val root = targetParent.canonicalFile
@@ -53,22 +57,35 @@ object DataTransfer {
             ZipInputStream(input.buffered()).use { zis ->
                 while (true) {
                     val entry = zis.nextEntry ?: break
-                    // Only accept the folders we export; ignore anything else.
-                    if (!entry.name.startsWith("paths/") && !entry.name.startsWith("captured-markers/")) continue
-                    val target = File(root, entry.name).canonicalFile
+                    if (entry.isDirectory) continue
+                    // Only the folders we export, found at any depth (a bundle compressed again on a computer is
+                    // wrapped in a folder); a computer's extra files and anything else are ignored.
+                    val relative = DataBundle.targetPath(entry.name) ?: continue
+                    val target = File(root, relative).canonicalFile
                     // Reject paths escaping the destination ("zip slip").
                     if (target != root && !target.path.startsWith(root.path + File.separator)) continue
-                    if (entry.isDirectory) {
-                        target.mkdirs()
-                    } else {
-                        target.parentFile?.mkdirs()
-                        target.outputStream().use { zis.copyTo(it) }
-                        written++
-                    }
+                    target.parentFile?.mkdirs()
+                    target.outputStream().use { zis.copyTo(it) }
+                    written++
                 }
             }
         }
         return written
+    }
+
+    /**
+     * Imports the bundle at [uri] into the app's files and says what can actually be used now, not just how many
+     * files were copied: a file the app couldn't read used to count as "loaded" and then silently not show up.
+     */
+    fun importWithSummary(context: Context, uri: Uri, venueId: String): String {
+        val count = runCatching { import(context, uri, context.filesDir) }.getOrElse { -1 }
+        val usablePaths = ArPathStore(File(context.filesDir, "paths")).load(venueId).size
+        val usablePoints = CapturedMarkerStore(File(context.filesDir, "captured-markers")).load(venueId).size
+        return when {
+            count < 0 -> "Couldn't read that file."
+            count == 0 -> "That file has no paths or reference points in it."
+            else -> "Imported $count file(s). Now saved: $usablePaths destination(s) and $usablePoints reference point(s)."
+        }
     }
 
     private fun File.invariantPath(): String = path.replace(File.separatorChar, '/')

@@ -102,8 +102,11 @@ data class Venue(
         val name: LocalizedText,
         /** Image path, relative to the venue package folder. */
         val image: String,
-        /** Printed width of the image, in meters. */
-        val physicalWidth: Float,
+        /**
+         * Printed width of the image, in meters; 0 when unknown (data from another app may leave it out), in which
+         * case ARCore estimates the size itself while it tracks the image.
+         */
+        val physicalWidth: Float = 0f,
         val level: String,
         /** Center of the printed image. */
         val x: Float,

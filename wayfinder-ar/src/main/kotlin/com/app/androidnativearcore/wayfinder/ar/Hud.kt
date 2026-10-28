@@ -75,7 +75,15 @@ fun GuidanceBannerView(banner: GuidanceBanner, modifier: Modifier = Modifier) {
 
 /** Shown until the session is aligned: asks the user to point the camera at an AR sign and shows what they look like. */
 @Composable
-fun AlignmentPromptView(message: String, signs: List<Pair<String, android.graphics.Bitmap>>, modifier: Modifier = Modifier) {
+fun AlignmentPromptView(
+    message: String,
+    signs: List<Pair<String, android.graphics.Bitmap>>,
+    modifier: Modifier = Modifier,
+    /** The photo chosen as a line-up guide (index into [signs]), highlighted. */
+    selected: Int? = null,
+    /** Called with the tapped photo's index; null makes the photos plain pictures. */
+    onSelect: ((Int) -> Unit)? = null,
+) {
     Column(
         modifier
             .fillMaxWidth()
@@ -83,16 +91,25 @@ fun AlignmentPromptView(message: String, signs: List<Pair<String, android.graphi
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text("Point your camera at an AR sign", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text("Point your camera at a sign or reference point", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         Text(message, color = Color.White.copy(alpha = 0.85f), fontSize = 14.sp)
+        if (onSelect != null) {
+            Text(
+                "Tap a reference photo to line up the camera with it: stand where it was taken.",
+                color = Color.White.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+            )
+        }
         Row(Modifier.horizontalScroll(rememberScrollState()).height(72.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            for ((name, bitmap) in signs) {
+            signs.forEachIndexed { index, (name, bitmap) ->
                 androidx.compose.foundation.Image(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = name,
                     modifier = Modifier
                         .height(72.dp)
-                        .background(Color.White, RoundedCornerShape(6.dp)),
+                        .background(Color.White, RoundedCornerShape(6.dp))
+                        .then(if (index == selected) Modifier.border(3.dp, Color(0xFF0A84FF), RoundedCornerShape(6.dp)) else Modifier)
+                        .then(if (onSelect != null) Modifier.clickable { onSelect(index) } else Modifier),
                 )
             }
         }

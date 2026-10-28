@@ -63,7 +63,9 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
                 continue
             }
             try {
-                database.addImage(marker.id, bitmap, marker.physicalWidth)
+                // Without a known width (0), ARCore estimates the image's size itself while tracking it.
+                if (marker.physicalWidth > 0f) database.addImage(marker.id, bitmap, marker.physicalWidth)
+                else database.addImage(marker.id, bitmap)
                 usableMarkers += marker
             } catch (e: Exception) {
                 unusableMarkers += marker to (e.message ?: e.javaClass.simpleName)
@@ -109,6 +111,12 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
             val cosine = if (toCameraLength > 1e-4f) {
                 kotlin.math.abs((normal[0] * toCamera[0] + normal[1] * toCamera[1] + normal[2] * toCamera[2]) / toCameraLength)
             } else 1f
+            // The size ARCore measures for the image: for a reference point exported without a width (0), this is
+            // ARCore's own estimate, and comparing it with the real size shows whether distances will be right.
+            android.util.Log.d(
+                ACCURACY_TAG,
+                "Image ${marker.id}: ARCore size %.2f x %.2f m (saved width %.2f m, 0 = unknown)".format(image.extentX, image.extentZ, marker.physicalWidth),
+            )
             out += MarkerSighting(marker, Mat4(matrix), distance, Vec3(camera.tx(), camera.ty(), camera.tz()), cosine)
         }
         return out

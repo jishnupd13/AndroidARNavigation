@@ -13,7 +13,8 @@ fun Venue.withExtraMarkers(extra: List<Venue.Marker>): Venue {
     if (extra.isEmpty()) return this
     val levelIDs = levels.map { it.id }.toSet()
     val existingIDs = markers.map { it.id }.toSet()
-    val additions = extra.filter { it.level in levelIDs && it.id !in existingIDs && it.physicalWidth > 0f }
+    // A width of 0 means unknown: ARCore then estimates it (see Venue.Marker.physicalWidth).
+    val additions = extra.filter { it.level in levelIDs && it.id !in existingIDs && it.physicalWidth >= 0f }
     if (additions.isEmpty()) return this
     // Place captured reference points first so camera prompt banners (.take(6)/.take(8)) always show them.
     return copy(markers = additions + markers)
@@ -30,7 +31,9 @@ data class StoredMarker(val venueId: String, val marker: Venue.Marker)
  * same [directory]; [Venue.Marker.image] holds that file's absolute path.
  */
 class CapturedMarkerStore(private val directory: File) {
-    private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
+    // coerceInputValues: a `null` written by another app (for example the iOS app's export) for a value that has a
+    // default here, such as an unknown width, reads as that default instead of making the whole file unreadable.
+    private val json = Json { ignoreUnknownKeys = true; prettyPrint = true; coerceInputValues = true }
 
     init {
         directory.mkdirs()

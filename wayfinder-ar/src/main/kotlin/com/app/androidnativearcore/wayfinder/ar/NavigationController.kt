@@ -151,11 +151,14 @@ class NavigationController(
         if (languages == null) text.resolved() else text.resolved(languages)
 
     init {
-        // Bootstrap alignment immediately so directions arrows render right away even before scanning a sign;
-        // scanning any reference point or AR sign will still refine/re-align the session.
-        isAligned = true
+        // Nothing is known about where the phone is until a sign or reference point is recognized: an alignment
+        // assumed up front made the screen claim a location and plan routes from a made-up position, and hid the
+        // prompt to scan. Ask for a scan first.
         currentLevel = destination.level
-        needsRoute = true
+        showAlignmentPrompt(
+            if (recordedFromMarkerId.isNotEmpty()) recordedSignPrompt()
+            else "Point the camera at a sign or a saved reference point, 1–2.5 m away, and hold it steady.",
+        )
     }
 
     private fun recordedSignPrompt(): String {

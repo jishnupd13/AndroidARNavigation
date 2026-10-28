@@ -52,11 +52,14 @@ fun WayFinderLocateScreen(
 ) {
     val venue = pkg.venue
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
-    val signs = remember(pkg) {
-        venue.markers.mapNotNull { marker ->
-            BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
-        }
+    val signMarkers = remember(pkg) {
+        venue.markers.mapNotNull { marker -> BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker to it } }
     }
+    val signs = remember(signMarkers) { signMarkers.map { (marker, bitmap) -> marker.name.resolved() to bitmap } }
+    // The reference photo chosen to line the camera up with, and where its frame is on screen.
+    var guide by remember { mutableStateOf<Int?>(null) }
+    var guideFrame by remember { mutableStateOf<FloatArray?>(null) }
+    val frameCount = remember { IntArray(1) }
     val filter = remember(pkg) { AlignmentFilter() }
     val reported = remember(pkg) { BooleanArray(1) }
     var matched by remember { mutableStateOf<Venue.Marker?>(null) }
@@ -85,6 +88,7 @@ fun WayFinderLocateScreen(
                 val message = ArMarkerTracker.trackingMessage(frame)
                 if (message != trackingMessage) trackingMessage = message
                 if (reported[0]) return@ARSceneView
+                if (frameCount[0]++ % 15 == 0) a4FrameOnScreen(frame, view)?.let { if (!it.contentEquals(guideFrame)) guideFrame = it }
                 val now = frame.timestamp / 1_000_000
                 for (sighting in markerTracker.sightings(frame, now, LOCATE_INTERVAL_MS)) {
                     // Sightings of two different points can't be averaged: start over when the camera moves to another.
@@ -112,6 +116,11 @@ fun WayFinderLocateScreen(
             onSessionFailed = { error -> toast = Toast((toast?.id ?: 0) + 1, "AR isn't available: ${error.message}", 8_000) },
         )
 
+        // The chosen reference photo, faded where it was framed, until a point is recognized.
+        val chosen = guide?.let { signMarkers.getOrNull(it) }?.takeIf { it.first.id.startsWith("ref-") }
+        val onScreen = guideFrame
+        if (matched == null && chosen != null && onScreen != null) ReferenceGuideOverlay(chosen.second, onScreen)
+
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
             val point = matched
             if (point == null) {
@@ -119,6 +128,8 @@ fun WayFinderLocateScreen(
                     trackingMessage ?: "Show the camera any reference point you can see (a sign or a marked spot) " +
                         "from 1–2.5 m and move the phone slowly side to side.",
                     signs,
+                    selected = guide,
+                    onSelect = { index -> guide = if (guide == index) null else index },
                 )
             } else {
                 GuidanceBannerView(

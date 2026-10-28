@@ -70,6 +70,8 @@ fun WayFinderNavigationScreen(
     placedObjects: List<PlacedObject> = emptyList(),
     /** The sign this destination's path was recorded from, if known. */
     recordedFromMarkerId: String = "",
+    /** A reference point the user was just located at (on the scan screen): offered first as the line-up guide. */
+    guideMarkerId: String = "",
     modifier: Modifier = Modifier,
     debug: Boolean = false,
 ) {
@@ -103,11 +105,20 @@ fun WayFinderNavigationScreen(
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
     val state = controller.uiState
     val activeDestination = controller.destination
-    val signs = remember(pkg) {
-        pkg.venue.markers.mapNotNull { marker ->
-            BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
-        }
+    val signMarkers = remember(pkg) {
+        pkg.venue.markers.mapNotNull { marker -> BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker to it } }
     }
+    val signs = remember(signMarkers) { signMarkers.map { (marker, bitmap) -> marker.name.resolved() to bitmap } }
+    // The reference photo to line the camera up with (the one this path was recorded from, if it is a photo), and
+    // where its frame is on screen.
+    var guide by remember(signMarkers) {
+        mutableStateOf(
+            signMarkers.indexOfFirst { it.first.id.startsWith("ref-") && (it.first.id == guideMarkerId || it.first.id == recordedFromMarkerId) }
+                .takeIf { it >= 0 },
+        )
+    }
+    var guideFrame by remember { mutableStateOf<FloatArray?>(null) }
+    val frameCount = remember { IntArray(1) }
     var showFeedback by remember { mutableStateOf(false) }
     var showNavHelp by remember { mutableStateOf(false) }
     var show2DMapDialog by remember { mutableStateOf(false) }
@@ -122,7 +133,9 @@ fun WayFinderNavigationScreen(
 
     // Current reference point name ("You are currently at")
     val userPos = state.user?.position
-    val currentAtName = remember(controller.lastAlignedMarker, userPos, refPins) {
+    val currentAtName = remember(controller.lastAlignedMarker, userPos, refPins, controller.isLockedIn) {
+        // Only once a sign or reference point was recognized: before that the position means nothing.
+        if (!controller.isLockedIn) return@remember "Scan a reference point / sign"
         val nearestRef = if (userPos != null) {
             refPins.minByOrNull { hypot(it.x - userPos.x, it.z - userPos.z) }
                 ?.takeIf { hypot(it.x - userPos.x, it.z - userPos.z) <= 2.5f }
@@ -185,6 +198,9 @@ fun WayFinderNavigationScreen(
             },
             onSessionUpdated = { session, frame ->
                 val now = frame.timestamp / 1_000_000
+                if (!controller.isLockedIn && frameCount[0]++ % 15 == 0) {
+                    a4FrameOnScreen(frame, view)?.let { if (!it.contentEquals(guideFrame)) guideFrame = it }
+                }
                 for (sighting in markerTracker.sightings(frame, now, if (controller.isLockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else 300L)) {
                     controller.onMarkerDetected(sighting.marker, sighting.markerInSession, sighting.distanceMeters, sighting.cameraInSession, sighting.viewCosine)
                 }
@@ -221,6 +237,11 @@ fun WayFinderNavigationScreen(
                 )
             }
         }
+
+        // Until the map is found: the chosen reference photo, faded where it was framed, to line the camera up with.
+        val chosen = guide?.let { signMarkers.getOrNull(it) }?.takeIf { it.first.id.startsWith("ref-") }
+        val onScreen = guideFrame
+        if (!controller.isLockedIn && chosen != null && onScreen != null) ReferenceGuideOverlay(chosen.second, onScreen)
 
         Column(
             Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -340,7 +361,9 @@ fun WayFinderNavigationScreen(
             }
 
             state.banner?.let { GuidanceBannerView(it) }
-            state.alignmentPrompt?.let { AlignmentPromptView(it, signs) }
+            state.alignmentPrompt?.let {
+                AlignmentPromptView(it, signs, selected = guide, onSelect = { index -> guide = if (guide == index) null else index })
+            }
         }
 
         if (debug && state.debug.isNotEmpty()) {

@@ -181,12 +181,15 @@ private fun displayRotationDegrees(view: android.view.View): Int = when (view.di
 /** Log tag for accuracy diagnostics: reference captures, object placement, alignment and tracking events. */
 internal const val ACCURACY_TAG = "WFAccuracy"
 
+/** A reference photo with less detail than this (0–100, [CameraImage.detailScore]) is slow to recognize. */
+private const val LOW_DETAIL = 35
+
 /** A new reference point closer than this (meters) to an existing one is reported as a duplicate. */
 private const val DUPLICATE_REFERENCE_M = 0.3f
 
 /** Why a reference point can't be added or a walk started yet: the saved map hasn't been found in this session. */
-private const val NOT_ON_MAP_YET = "First point the camera at a sign or a saved reference point and hold it until it " +
-    "is recognized, so new points are saved on the same map as the others."
+private const val NOT_ON_MAP_YET = "First find the saved map: point the camera at a sign or a saved reference point " +
+    "(tap its photo at the top to line it up) and hold it until it is recognized. New points then line up with the others."
 
 /** Auto-capture a reference point roughly every this many metres walked (when the toggle is on). */
 private const val AUTO_INTERVAL_M = 3f
@@ -284,11 +287,11 @@ fun WayFinderCaptureScreen(
     val defaultLevel = venue.levels.firstOrNull()?.id.orEmpty()
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
     val planner = remember(venue) { RoutePlanner(venue) }
-    val signs = remember(pkg) {
-        venue.markers.mapNotNull { marker ->
-            BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker.name.resolved() to it }
-        }
+    val signMarkers = remember(pkg) {
+        venue.markers.mapNotNull { marker -> BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker to it } }
     }
+    val signs = remember(signMarkers) { signMarkers.map { (marker, bitmap) -> marker.name.resolved() to bitmap } }
+    var guide by remember { mutableStateOf<Int?>(null) } // the saved reference photo chosen to line the camera up with
 
     // --- Recording state ---
     val filter = remember(pkg) { AlignmentFilter() }
@@ -1147,7 +1150,9 @@ fun WayFinderCaptureScreen(
                 val agreement = if (filter.isLockedIn) "sign ±$spread cm" else ""
                 if (agreement != signAgreement) signAgreement = agreement
                 lockProgress = filter.closeSightings.coerceAtMost(AlignmentFilter.LOCK_IN_SIGHTINGS)
-                lockedIn = filter.isLockedIn
+                val nowLocked = filter.isLockedIn
+                if (nowLocked && !lockedIn && hadSavedMap) greenFlash = "Map found — you can add reference points now"
+                lockedIn = nowLocked
                 stable.update(session, filter.alignment, onMap(), frame.timestamp)
 
                 if (message == null && frameCounter[0] % 2 == 0) {
@@ -1229,8 +1234,14 @@ fun WayFinderCaptureScreen(
             ObjectsScene(sessionObjects.toList(), Mat4.IDENTITY, cameraPosition)
         }
 
+        // Until the saved map is found: the chosen saved reference photo, faded where it was framed, to line up with.
+        val needsMap = hadSavedMap && !lockedIn
+        val chosenGuide = guide?.let { signMarkers.getOrNull(it) }?.takeIf { it.first.id.startsWith("ref-") }
+        val guideOnScreen = a4Frame
+        if (needsMap && chosenGuide != null && guideOnScreen != null) ReferenceGuideOverlay(chosenGuide.second, guideOnScreen)
+
         // The A4 frame: exactly what ◎ photographs as a reference point.
-        a4Frame?.let { r ->
+        a4Frame?.takeIf { !(needsMap && chosenGuide != null) }?.let { r ->
             Canvas(Modifier.fillMaxSize()) {
                 drawRoundRect(
                     color = Color.White.copy(alpha = 0.8f),
@@ -1265,6 +1276,16 @@ fun WayFinderCaptureScreen(
             Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            // This place already has a saved map: it must be recognized before anything new can be added to it.
+            if (hadSavedMap && !lockedIn) {
+                AlignmentPromptView(
+                    trackingMessage ?: "Find the saved map first: point at a sign or a saved reference point, 1–2.5 m " +
+                        "away, until it is recognized. Then add reference points, objects and paths.",
+                    signs,
+                    selected = guide,
+                    onSelect = { index -> guide = if (guide == index) null else index },
+                )
+            }
             // Compact recording status banner
             val objectCount = allVenueObjects.count { !it.isReference } + sessionObjects.count { !it.isReference }
             GuidanceBannerView(
@@ -1772,6 +1793,7 @@ fun WayFinderCaptureScreen(
         val quality = when {
             !ref.accepted -> "Low contrast — will still save as reference pin"
             ref.detail >= 55 -> "Good detail — trackable"
+            ref.detail < LOW_DETAIL -> "Very little detail — will be slow or hard to recognize"
             else -> "Low detail — may need close-up view"
         }
         AlertDialog(
@@ -1796,6 +1818,14 @@ fun WayFinderCaptureScreen(
                     Text(quality, fontWeight = FontWeight.Bold)
                     Text("Quality ${ref.detail}/100 · about %.1f m away".format(ref.distanceM))
                     ref.problem?.let { Text("⚠ $it", color = Color(0xFFFF9500)) }
+                    // What decides how fast the photo is recognized later.
+                    Text(
+                        "Recognized in about a second: flat, detailed surfaces such as posters, signs, paintings or a " +
+                            "printed sheet. Plants, furniture and objects are only recognized from almost exactly this " +
+                            "spot, which can take a long search.",
+                        fontSize = 12.sp,
+                        color = Color.Gray,
+                    )
                     OutlinedTextField(
                         value = refName,
                         onValueChange = { refName = it },
@@ -1822,7 +1852,7 @@ fun WayFinderCaptureScreen(
                         greenFlash = "Reference point “$trimmed” saved"
                         pendingRef = null
                     },
-                ) { Text("Save") }
+                ) { Text(if (ref.problem != null || ref.detail < LOW_DETAIL) "Save anyway" else "Save") }
             },
             dismissButton = { TextButton(onClick = { pendingRef = null }) { Text("Retake") } },
         )
