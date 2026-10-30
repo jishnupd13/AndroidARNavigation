@@ -45,6 +45,13 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
     private val markersByID = pkg.venue.markers.associateBy { it.id }
     private val lastReportedMs = HashMap<String, Long>()
 
+    /**
+     * Called once per image without a saved size (physical width 0), after a few sightings, with the width ARCore
+     * measured for it, so it can be saved: next time the image is recognized at once, without having to move.
+     */
+    var onSizeMeasured: ((Venue.Marker, Float) -> Unit)? = null
+    private val unsizedSightings = HashMap<String, Int>()
+
     /** Markers successfully added to the ARCore AugmentedImageDatabase. */
     val usableMarkers = mutableListOf<Venue.Marker>()
 
@@ -117,6 +124,11 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
                 ACCURACY_TAG,
                 "Image ${marker.id}: ARCore size %.2f x %.2f m (saved width %.2f m, 0 = unknown)".format(image.extentX, image.extentZ, marker.physicalWidth),
             )
+            if (marker.physicalWidth <= 0f && image.extentX > 0.05f) {
+                val count = (unsizedSightings[marker.id] ?: 0) + 1
+                unsizedSightings[marker.id] = count
+                if (count == SIZE_MEASURE_SIGHTINGS) onSizeMeasured?.invoke(marker, image.extentX)
+            }
             out += MarkerSighting(marker, Mat4(matrix), distance, Vec3(camera.tx(), camera.ty(), camera.tz()), cosine)
         }
         return out
@@ -258,6 +270,9 @@ class ArMarkerTracker(private val pkg: VenuePackage) {
 
     companion object {
         const val REDETECT_INTERVAL_MS = 1_500L
+
+        /** ARCore's size estimate for an image without a saved size is used after this many sightings. */
+        private const val SIZE_MEASURE_SIGHTINGS = 3
 
         /** Widest camera image (pixels) used for tracking; larger costs too much CPU on mid-range phones. */
         private const val MAX_TRACKING_IMAGE_WIDTH = 1280

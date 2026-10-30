@@ -42,6 +42,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -206,6 +207,19 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
         screen = Screen.Locate
     }
 
+    // A reference point saved without a size (as the iPhone app exports them) gets the size ARCore measured for it,
+    // so next time it is recognized at once instead of only while the phone moves. Written to disk only: reloading it
+    // now would restart the camera; it is picked up when the list is shown again.
+    fun saveMeasuredSize(markerId: String, width: Float) {
+        markerStore.load(basePackage.venue.id).firstOrNull { it.id == markerId && it.physicalWidth <= 0f }?.let {
+            markerStore.save(basePackage.venue.id, it.copy(physicalWidth = width))
+            Log.i(TAG, "Saved the measured width %.2f m for reference point %s".format(width, markerId))
+        }
+    }
+    LaunchedEffect(screen) {
+        if (screen == Screen.List || screen == Screen.Home) extraMarkers = markerStore.load(basePackage.venue.id)
+    }
+
     when (val current = screen) {
         Screen.Home -> HomeScreen(onPick = { picked ->
             mode = picked
@@ -215,6 +229,7 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
             pkg = pkg,
             onLocated = { screen = Screen.Nearby(it) },
             onCancel = { screen = Screen.List },
+            onReferenceSizeMeasured = ::saveMeasuredSize,
         )
         is Screen.Nearby -> {
             BackHandler { screen = Screen.List }
@@ -271,6 +286,7 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
         }
         is Screen.Capture -> WayFinderCaptureScreen(
             pkg = pkg,
+            onReferenceSizeMeasured = ::saveMeasuredSize,
             existingWalkedPoints = allWalkedPoints,
             existingObjects = allPlacedObjects,
             initialFromRefId = current.fromRefId,
@@ -390,6 +406,7 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
             }
             WayFinderNavigationScreen(
                 pkg = pkg,
+                onReferenceSizeMeasured = ::saveMeasuredSize,
                 destinationId = current.poi.id,
                 profile = current.profile,
                 listener = listener,

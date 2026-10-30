@@ -263,6 +263,8 @@ fun WayFinderCaptureScreen(
     pkg: VenuePackage,
     onSave: (CapturedDestination) -> Unit,
     onCancel: () -> Unit,
+    /** A reference photo saved without a size was measured by ARCore (width in meters): save it for next time. */
+    onReferenceSizeMeasured: (markerId: String, widthMeters: Float) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
     /** Called when the admin captures and confirms a reference point; the caller persists it. */
     onSaveReferencePoint: (CapturedReferencePoint) -> Unit = {},
@@ -286,6 +288,7 @@ fun WayFinderCaptureScreen(
     val venue = pkg.venue
     val defaultLevel = venue.levels.firstOrNull()?.id.orEmpty()
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
+    markerTracker.onSizeMeasured = { marker, width -> onReferenceSizeMeasured(marker.id, width) }
     val planner = remember(venue) { RoutePlanner(venue) }
     val signMarkers = remember(pkg) {
         venue.markers.mapNotNull { marker -> BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker to it } }
@@ -350,6 +353,7 @@ fun WayFinderCaptureScreen(
     var pendingRef by remember { mutableStateOf<RefCapture?>(null) }
     var refFailure by remember { mutableStateOf<String?>(null) } // why the last reference capture was refused
     var a4Frame by remember { mutableStateOf<FloatArray?>(null) } // the A4 photo frame on screen: left, top, right, bottom
+    var cameraFrame by remember { mutableStateOf<FloatArray?>(null) } // the whole camera view on screen
     // Set when tracking was lost long enough that the session frame may have been re-based: from then on, new points
     // need the map to be found again even in a place that had no saved map (the earlier ones are in the old frame).
     val mapFrameLost = remember { BooleanArray(1) }
@@ -1082,6 +1086,7 @@ fun WayFinderCaptureScreen(
                         val rect = floatArrayOf(xs.min(), ys.min(), xs.max(), ys.max())
                         val old = a4Frame
                         if (old == null || rect.indices.any { kotlin.math.abs(old[it] - rect[it]) > 2f }) a4Frame = rect
+                        cameraViewOnScreen(frame)?.let { if (!it.contentEquals(cameraFrame)) cameraFrame = it }
                     }
                 }
 
@@ -1234,11 +1239,8 @@ fun WayFinderCaptureScreen(
             ObjectsScene(sessionObjects.toList(), Mat4.IDENTITY, cameraPosition)
         }
 
-        // Until the saved map is found: the chosen saved reference photo, faded where it was framed, to line up with.
         val needsMap = hadSavedMap && !lockedIn
         val chosenGuide = guide?.let { signMarkers.getOrNull(it) }?.takeIf { it.first.id.startsWith("ref-") }
-        val guideOnScreen = a4Frame
-        if (needsMap && chosenGuide != null && guideOnScreen != null) ReferenceGuideOverlay(chosenGuide.second, guideOnScreen)
 
         // The A4 frame: exactly what ◎ photographs as a reference point.
         a4Frame?.takeIf { !(needsMap && chosenGuide != null) }?.let { r ->
@@ -1270,6 +1272,12 @@ fun WayFinderCaptureScreen(
                 }
             },
         )
+
+        // Until the saved map is found: the chosen saved reference photo, faded where it was framed, to line up with.
+        // Above the tap area so its size buttons can be pressed.
+        if (needsMap && chosenGuide != null) {
+            ReferenceGuideOverlay(chosenGuide.second, a4Frame, cameraFrame, sizeUnknown = chosenGuide.first.physicalWidth <= 0f)
+        }
 
         // Top HUD: the recording status banner
         Column(

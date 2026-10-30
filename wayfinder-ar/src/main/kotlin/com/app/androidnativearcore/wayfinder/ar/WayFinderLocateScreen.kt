@@ -48,10 +48,13 @@ fun WayFinderLocateScreen(
     pkg: VenuePackage,
     onLocated: (LocatedUser) -> Unit,
     onCancel: () -> Unit,
+    /** A reference photo saved without a size was measured by ARCore (width in meters): save it for next time. */
+    onReferenceSizeMeasured: (markerId: String, widthMeters: Float) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val venue = pkg.venue
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
+    markerTracker.onSizeMeasured = { marker, width -> onReferenceSizeMeasured(marker.id, width) }
     val signMarkers = remember(pkg) {
         venue.markers.mapNotNull { marker -> BitmapFactory.decodeFile(pkg.file(marker).path)?.let { marker to it } }
     }
@@ -59,6 +62,7 @@ fun WayFinderLocateScreen(
     // The reference photo chosen to line the camera up with, and where its frame is on screen.
     var guide by remember { mutableStateOf<Int?>(null) }
     var guideFrame by remember { mutableStateOf<FloatArray?>(null) }
+    var cameraFrame by remember { mutableStateOf<FloatArray?>(null) } // the whole camera view on screen
     val frameCount = remember { IntArray(1) }
     val filter = remember(pkg) { AlignmentFilter() }
     val reported = remember(pkg) { BooleanArray(1) }
@@ -88,7 +92,10 @@ fun WayFinderLocateScreen(
                 val message = ArMarkerTracker.trackingMessage(frame)
                 if (message != trackingMessage) trackingMessage = message
                 if (reported[0]) return@ARSceneView
-                if (frameCount[0]++ % 15 == 0) a4FrameOnScreen(frame, view)?.let { if (!it.contentEquals(guideFrame)) guideFrame = it }
+                if (frameCount[0]++ % 15 == 0) {
+                    a4FrameOnScreen(frame, view)?.let { if (!it.contentEquals(guideFrame)) guideFrame = it }
+                    cameraViewOnScreen(frame)?.let { if (!it.contentEquals(cameraFrame)) cameraFrame = it }
+                }
                 val now = frame.timestamp / 1_000_000
                 for (sighting in markerTracker.sightings(frame, now, LOCATE_INTERVAL_MS)) {
                     // Sightings of two different points can't be averaged: start over when the camera moves to another.
@@ -118,8 +125,9 @@ fun WayFinderLocateScreen(
 
         // The chosen reference photo, faded where it was framed, until a point is recognized.
         val chosen = guide?.let { signMarkers.getOrNull(it) }?.takeIf { it.first.id.startsWith("ref-") }
-        val onScreen = guideFrame
-        if (matched == null && chosen != null && onScreen != null) ReferenceGuideOverlay(chosen.second, onScreen)
+        if (matched == null && chosen != null) {
+            ReferenceGuideOverlay(chosen.second, guideFrame, cameraFrame, sizeUnknown = chosen.first.physicalWidth <= 0f)
+        }
 
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
             val point = matched

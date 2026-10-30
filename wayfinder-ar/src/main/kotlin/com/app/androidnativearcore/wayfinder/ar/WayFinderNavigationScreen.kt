@@ -72,6 +72,8 @@ fun WayFinderNavigationScreen(
     recordedFromMarkerId: String = "",
     /** A reference point the user was just located at (on the scan screen): offered first as the line-up guide. */
     guideMarkerId: String = "",
+    /** A reference photo saved without a size was measured by ARCore (width in meters): save it for next time. */
+    onReferenceSizeMeasured: (markerId: String, widthMeters: Float) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
     debug: Boolean = false,
 ) {
@@ -103,6 +105,7 @@ fun WayFinderNavigationScreen(
     }
 
     val markerTracker = remember(pkg) { ArMarkerTracker(pkg) }
+    markerTracker.onSizeMeasured = { marker, width -> onReferenceSizeMeasured(marker.id, width) }
     val state = controller.uiState
     val activeDestination = controller.destination
     val signMarkers = remember(pkg) {
@@ -118,6 +121,7 @@ fun WayFinderNavigationScreen(
         )
     }
     var guideFrame by remember { mutableStateOf<FloatArray?>(null) }
+    var cameraFrame by remember { mutableStateOf<FloatArray?>(null) } // the whole camera view on screen
     val frameCount = remember { IntArray(1) }
     var showFeedback by remember { mutableStateOf(false) }
     var showNavHelp by remember { mutableStateOf(false) }
@@ -200,6 +204,7 @@ fun WayFinderNavigationScreen(
                 val now = frame.timestamp / 1_000_000
                 if (!controller.isLockedIn && frameCount[0]++ % 15 == 0) {
                     a4FrameOnScreen(frame, view)?.let { if (!it.contentEquals(guideFrame)) guideFrame = it }
+                    cameraViewOnScreen(frame)?.let { if (!it.contentEquals(cameraFrame)) cameraFrame = it }
                 }
                 for (sighting in markerTracker.sightings(frame, now, if (controller.isLockedIn) ArMarkerTracker.REDETECT_INTERVAL_MS else 300L)) {
                     controller.onMarkerDetected(sighting.marker, sighting.markerInSession, sighting.distanceMeters, sighting.cameraInSession, sighting.viewCosine)
@@ -240,8 +245,9 @@ fun WayFinderNavigationScreen(
 
         // Until the map is found: the chosen reference photo, faded where it was framed, to line the camera up with.
         val chosen = guide?.let { signMarkers.getOrNull(it) }?.takeIf { it.first.id.startsWith("ref-") }
-        val onScreen = guideFrame
-        if (!controller.isLockedIn && chosen != null && onScreen != null) ReferenceGuideOverlay(chosen.second, onScreen)
+        if (!controller.isLockedIn && chosen != null) {
+            ReferenceGuideOverlay(chosen.second, guideFrame, cameraFrame, sizeUnknown = chosen.first.physicalWidth <= 0f)
+        }
 
         Column(
             Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 12.dp, vertical = 8.dp),
