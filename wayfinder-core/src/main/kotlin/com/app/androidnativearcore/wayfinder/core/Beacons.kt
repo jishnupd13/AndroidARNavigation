@@ -40,6 +40,12 @@ data class RegisteredBeacon(
      * makes distances, and so which beacon is nearest, comparable between beacons.
      */
     val rssiAt1m: Int? = null,
+    /**
+     * The beacon's signal measured 0.5 m away when the admin calibrated it (dBm), or null: the threshold at which the
+     * visitor counts as at the beacon ([BeaconDetector]). Measured there, it is far more exact than projecting 0.5 m
+     * from [rssiAt1m].
+     */
+    val rssiAt05m: Int? = null,
 ) {
     /** True if the beacon carries at least one identifier the app can recognize it by. */
     val identifies: Boolean get() = uuid.isNotEmpty() || macAddress.isNotEmpty()
@@ -110,8 +116,8 @@ object Beacons {
         // The position is optional, but half a position (or a broken number) is a mistake.
         if ((beacon.x == null) != (beacon.y == null)) out += "Enter both X and Y, or leave both empty."
         if (listOfNotNull(beacon.x, beacon.y).any { !it.isFinite() }) out += "X and Y must be numbers in meters."
-        if (beacon.rssiAt1m != null && beacon.rssiAt1m !in MIN_RSSI_AT_1M..MAX_RSSI_AT_1M) {
-            out += "The calibrated signal must be between $MIN_RSSI_AT_1M and $MAX_RSSI_AT_1M dBm."
+        for (calibrated in listOfNotNull(beacon.rssiAt1m, beacon.rssiAt05m)) {
+            if (calibrated !in MIN_RSSI_AT_1M..MAX_RSSI_AT_1M) out += "A calibrated signal must be between $MIN_RSSI_AT_1M and $MAX_RSSI_AT_1M dBm."
         }
         others.firstOrNull { it.beaconId != beacon.beaconId && it.sameDeviceAs(beacon) }?.let {
             out += "This beacon is already registered as “${it.name}”."

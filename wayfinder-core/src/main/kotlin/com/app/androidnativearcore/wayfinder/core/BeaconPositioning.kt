@@ -48,8 +48,12 @@ data class BeaconFix(
 data class HeardBeacon(val beacon: RegisteredBeacon, val device: NearbyDevice) {
     val rssi: Int get() = device.rssi
 
-    /** The beacon's signal 1 m away: as calibrated by the admin, else as the beacon advertises it, else unknown. */
-    val strengthAt1m: Int? get() = beacon.rssiAt1m ?: device.identity.txPowerAt1m
+    /**
+     * The beacon's signal 1 m away: as calibrated by the admin, else as the beacon advertises it if that is plausible
+     * (beacon apps sometimes advertise nonsense, like −91 dBm), else unknown.
+     */
+    val strengthAt1m: Int?
+        get() = beacon.rssiAt1m ?: device.identity.txPowerAt1m?.takeIf { it in PLAUSIBLE_STRENGTH_AT_1M }
 
     /** A rough distance (meters) from the signal and [strengthAt1m], or null when that is unknown. */
     val roughDistanceMeters: Float? get() = strengthAt1m?.let(device::roughDistanceFor)
@@ -73,6 +77,9 @@ internal fun atBeacon(rssi: Int, calibratedMeters: Float?): Boolean =
 
 /** What a beacon's signal 1 m away usually is (dBm), for beacons that neither were calibrated nor advertise it. */
 const val DEFAULT_STRENGTH_AT_1M = -59
+
+/** Advertised strengths at 1 m (dBm) outside this range are wrong (a misconfigured beacon), and ignored. */
+val PLAUSIBLE_STRENGTH_AT_1M = -75..-45
 
 /**
  * True when the visitor is clearly at [beaconId] rather than between beacons: it sounds nearer, for its own
@@ -344,35 +351,138 @@ class ProximityTrend(
 /** The distance (meters) from the beacon's signal: with its calibrated or advertised strength, else a usual one. */
 val HeardBeacon.distanceMeters: Float get() = roughDistanceMeters ?: device.roughDistanceFor(DEFAULT_STRENGTH_AT_1M)
 
-/**
- * Which beacons the visitor is right at, by signal strength alone: within [showWithinMeters]. One shown stays shown
- * until it sounds farther than [hideBeyondMeters], so a signal wobbling around the edge doesn't make it flicker; one
- * no longer heard is gone at once. Nothing is remembered beyond that: walk away (or move the beacon) and it is gone.
- *
- * The distance comes from the signal and the beacon's strength 1 m away, so it is only as good as that strength:
- * calibrate each beacon ([RegisteredBeacon.rssiAt1m]) for 0.5 m to mean 0.5 m.
- */
-class BeaconProximity(
-    private val showWithinMeters: Float = SHOW_WITHIN_M,
-    private val hideBeyondMeters: Float = HIDE_BEYOND_M,
-) {
-    private val shown = mutableSetOf<String>()
+/** A beacon's signal is this much stronger 0.5 m away than 1 m away (dB): path loss 2.5 halves the distance by 7.5 dB. */
+const val HALF_METER_GAIN_DB = 8
 
-    /** The beacons to show now, by id. */
-    fun update(heard: List<HeardBeacon>): Set<String> {
-        val distances = heard.associate { it.beacon.beaconId to it.distanceMeters }
-        shown.retainAll { id -> distances[id]?.let { it <= hideBeyondMeters } == true }
-        distances.filterValues { it <= showWithinMeters }.keys.forEach { shown += it }
-        return shown.toSet()
+/**
+ * The filtered signal (dBm) at which the visitor counts as at the beacon (about 0.5 m): as the admin calibrated it
+ * there (or projected from 1 m), but never weaker than [STRONG_SIGNAL_DBM]: only a strong signal ever shows the
+ * icon, so a calibration made with something in the way (it then reads weak, and 0.5 m would really be 2 m) can't
+ * make it show early. What a beacon says about its own strength is never used for this.
+ */
+val HeardBeacon.detectRssi: Int
+    get() = maxOf(STRONG_SIGNAL_DBM, beacon.rssiAt05m ?: beacon.rssiAt1m?.plus(HALF_METER_GAIN_DB) ?: STRONG_SIGNAL_DBM)
+
+/**
+ * The weakest filtered signal (dBm) that can count as at a beacon. For a beacon not calibrated it is the threshold;
+ * a calibration can only make it stricter (a loud beacon calibrated at −45 dBm needs −45).
+ */
+const val STRONG_SIGNAL_DBM = -55
+
+/** True when the 0.5 m threshold was measured at 0.5 m, not projected from 1 m. */
+val HeardBeacon.thresholdCalibrated: Boolean get() = beacon.rssiAt05m != null
+
+/** True when the admin calibrated the beacon at all (at 0.5 m or 1 m); otherwise its 0.5 m is a cautious guess. */
+val HeardBeacon.isCalibrated: Boolean get() = beacon.rssiAt05m != null || beacon.rssiAt1m != null
+
+/** How strong a beacon's signal is against its 0.5 m threshold. Only [STRONG] can mean "at the beacon". */
+enum class SignalLevel { WEAK, MEDIUM, STRONG }
+
+val HeardBeacon.signalLevel: SignalLevel
+    get() = when {
+        rssi >= detectRssi - BeaconDetector.ENTER_MARGIN_DB -> SignalLevel.STRONG
+        rssi >= detectRssi - BeaconDetector.MEDIUM_BELOW_DB -> SignalLevel.MEDIUM
+        else -> SignalLevel.WEAK
     }
 
-    fun reset() = shown.clear()
+/**
+ * Detects the beacons the visitor is at: within about 0.5 m, by Bluetooth signal strength.
+ *
+ * A beacon merely heard is not detected. Its filtered signal (the median of the last few seconds, [NearbyDevices])
+ * must reach its 0.5 m threshold ([detectRssi], never weaker than [STRONG_SIGNAL_DBM]) and stay there for
+ * [enterHoldMillis], and it must sound clearly nearer than every other beacon ([CLEAR_GAP_DB]): a weak or medium
+ * signal never counts, and neither does one reading. For a beacon the admin hasn't calibrated, the threshold is a cautious guess.
+ *
+ * Once detected, it stays detected while the visitor stays put: turning around puts the body between phone and
+ * beacon and weakens the signal by up to 15 dB, without changing the distance. It is lost
+ * - at once when the phone moved more than [leaveMeters] from where it was detected (the beacon was within 0.5 m of
+ *   that spot, so it is out of range now);
+ * - when its signal stayed well below the threshold for [exitHoldMillis] and the phone moved at least [moveMeters]
+ *   (or where the phone is isn't known);
+ * - when it hasn't been heard at all for [unheardMillis].
+ * Where the phone is comes from the camera's motion tracking, accurate to centimeters.
+ */
+class BeaconDetector(
+    private val enterHoldMillis: Long = ENTER_HOLD_MS,
+    private val exitHoldMillis: Long = EXIT_HOLD_MS,
+    private val leaveMeters: Float = LEAVE_M,
+    private val moveMeters: Float = MOVE_M,
+    private val unheardMillis: Long = UNHEARD_MS,
+) {
+    private class State {
+        var strongSince: Long? = null
+        var weakSince: Long? = null
+        var unheardSince: Long? = null
+        var detected = false
+        var detectedAt: Vec3? = null
+    }
+
+    private val states = mutableMapOf<String, State>()
+
+    /**
+     * Updates the detections from the beacons [heard] now (their filtered signals) and where the [phone] is (null
+     * when the camera isn't tracking), and returns the ids of the beacons the visitor is at.
+     */
+    fun update(heard: List<HeardBeacon>, phone: Vec3?, nowMillis: Long): Set<String> {
+        val byId = heard.associateBy { it.beacon.beaconId }
+        for (id in states.keys + byId.keys) {
+            val state = states.getOrPut(id) { State() }
+            val signal = byId[id]
+            // Strong, and clearly the nearest beacon: two beacons can't both be within 0.5 m of the phone.
+            val strong = signal != null && signal.rssi >= signal.detectRssi - ENTER_MARGIN_DB &&
+                heard.all { it.beacon.beaconId == id || it.rssi - it.detectRssi <= signal.rssi - signal.detectRssi - CLEAR_GAP_DB }
+            val wellBelow = signal == null || signal.rssi < signal.detectRssi - EXIT_MARGIN_DB
+            state.unheardSince = if (signal == null) state.unheardSince ?: nowMillis else null
+            if (!state.detected) {
+                state.strongSince = if (strong) state.strongSince ?: nowMillis else null
+                if (strong && nowMillis - state.strongSince!! >= enterHoldMillis) {
+                    state.detected = true
+                    state.detectedAt = phone
+                    state.weakSince = null
+                }
+                continue
+            }
+            val moved = if (phone != null) state.detectedAt?.let { horizontal(phone, it) } else null
+            if (state.detectedAt == null && phone != null) state.detectedAt = phone // tracking came back: from here
+            state.weakSince = if (wellBelow) state.weakSince ?: nowMillis else null
+            val lost = (moved != null && moved > leaveMeters) ||
+                (state.weakSince?.let { nowMillis - it >= exitHoldMillis } == true && (moved == null || moved >= moveMeters)) ||
+                (state.unheardSince?.let { nowMillis - it >= unheardMillis } == true)
+            if (lost) states[id] = State()
+        }
+        return states.filterValues { it.detected }.keys.toSet()
+    }
+
+    /** Where the phone was when [beaconId] was detected, while it is. */
+    fun detectedAt(beaconId: String): Vec3? = states[beaconId]?.takeIf { it.detected }?.detectedAt
+
+    fun reset() = states.clear()
+
+    private fun horizontal(a: Vec3, b: Vec3) = kotlin.math.hypot(a.x - b.x, a.z - b.z)
 
     companion object {
-        /** A beacon's logo shows within this distance (meters) of it. */
-        const val SHOW_WITHIN_M = 0.5f
+        /** Strong enough: at the 0.5 m threshold (no slack under it). */
+        const val ENTER_MARGIN_DB = 0
 
-        /** …and hides again beyond this one. */
-        const val HIDE_BEYOND_M = 0.7f
+        /** Medium: up to this far (dB) under the threshold; weaker is weak. */
+        const val MEDIUM_BELOW_DB = 12
+
+        /** Well below: this far (dB) under the threshold, more than a wobble. */
+        const val EXIT_MARGIN_DB = 8
+
+        /** The signal must stay strong this long (ms) before the beacon counts as detected. */
+        const val ENTER_HOLD_MS = 1_500L
+
+        /** …and well below this long (ms) before it is lost (with the phone moved). */
+        const val EXIT_HOLD_MS = 3_000L
+
+        /** The phone moved this far (meters) from where the beacon was detected: out of its 0.5 m range. */
+        const val LEAVE_M = 1.0f
+
+        /** A weak signal only counts as having left once the phone moved this much (meters), not on turning around. */
+        const val MOVE_M = 0.4f
+
+        /** Not heard at all this long (ms): gone. */
+        const val UNHEARD_MS = 10_000L
     }
 }

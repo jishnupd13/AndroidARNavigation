@@ -324,45 +324,121 @@ class ProximityTrendTest {
     }
 }
 
-class BeaconProximityTest {
+class BeaconDetectorTest {
     private val uuid = "18516F0F-64DE-42B1-8707-F02A087E5733"
-    private val loud = RegisteredBeacon("BEACON_001", "iphone17", uuid, 1, 1, floorId = "L0", rssiAt1m = -45)
-    private val quiet = RegisteredBeacon("BEACON_002", "OnePlus", uuid, 2, 2, floorId = "L0", rssiAt1m = -70)
+    private val iphone = RegisteredBeacon("BEACON_001", "iphone17", uuid, 1, 1, floorId = "L0", rssiAt1m = -50, rssiAt05m = -43)
+    private val onePlus = RegisteredBeacon("BEACON_002", "OnePlus", uuid, 2, 2, floorId = "L0", rssiAt1m = -72, rssiAt05m = -64)
+    private val here = Vec3(0f, 1.3f, 0f)
 
-    /** A beacon heard [meters] away, as its signal would be with path-loss exponent 2.5. */
-    private fun at(beacon: RegisteredBeacon, meters: Double): HeardBeacon {
-        val rssi = (beacon.rssiAt1m!! - 25 * kotlin.math.log10(meters)).roundToIntExact()
-        return HeardBeacon(beacon, NearbyDevice(BeaconIdentity.IBeacon(uuid, beacon.major!!, beacon.minor!!, -59), "AA", null, rssi, 5, 0L))
-    }
+    private fun heard(beacon: RegisteredBeacon, rssi: Int) =
+        HeardBeacon(beacon, NearbyDevice(BeaconIdentity.IBeacon(uuid, beacon.major!!, beacon.minor!!, -59), "AA", null, rssi, 5, 0L))
 
-    private fun Double.roundToIntExact() = kotlin.math.round(this).toInt()
-
-    @Test
-    fun aBeaconShowsOnlyWithinHalfAMeter() {
-        val proximity = BeaconProximity()
-        assertEquals(emptySet<String>(), proximity.update(listOf(at(loud, 1.5), at(quiet, 2.0))))
-        assertEquals(setOf("BEACON_001"), proximity.update(listOf(at(loud, 0.4), at(quiet, 2.0))))
+    /** Feeds the same signals every half second from [from] to [to] (ms); returns the last detections. */
+    private fun BeaconDetector.hold(signals: List<HeardBeacon>, from: Long, to: Long, phone: Vec3? = here): Set<String> {
+        var out = emptySet<String>()
+        var t = from
+        while (t <= to) { out = update(signals, phone, t); t += 500 }
+        return out
     }
 
     @Test
-    fun aQuietBeaconShowsWhenCloseToo() {
-        // Calibrated, its weak signal still says 0.4 m.
-        assertEquals(setOf("BEACON_002"), BeaconProximity().update(listOf(at(quiet, 0.4), at(loud, 3.0))))
+    fun aWeakOrMediumSignalIsNeverDetected() {
+        val detector = BeaconDetector()
+        assertEquals("heard, 2 m away", emptySet<String>(), detector.hold(listOf(heard(iphone, -58)), 0, 10_000))
+        assertEquals("medium, 1 m away", emptySet<String>(), detector.hold(listOf(heard(iphone, -50)), 10_500, 20_000))
+        assertEquals(SignalLevel.MEDIUM, heard(iphone, -50).signalLevel)
+        assertEquals(SignalLevel.WEAK, heard(iphone, -60).signalLevel)
     }
 
     @Test
-    fun itStaysShownAroundTheEdgeAndHidesFartherAway() {
-        val proximity = BeaconProximity()
-        proximity.update(listOf(at(loud, 0.45)))
-        assertEquals("a wobble to 0.6 m", setOf("BEACON_001"), proximity.update(listOf(at(loud, 0.6))))
-        assertEquals("walked away", emptySet<String>(), proximity.update(listOf(at(loud, 1.0))))
-        assertEquals("not back within 0.5 m yet", emptySet<String>(), proximity.update(listOf(at(loud, 0.6))))
+    fun aStrongSignalIsDetectedOnceItHolds() {
+        val detector = BeaconDetector()
+        assertEquals("one moment is not enough", emptySet<String>(), detector.hold(listOf(heard(iphone, -42)), 0, 1_000))
+        assertEquals(setOf("BEACON_001"), detector.hold(listOf(heard(iphone, -42)), 1_500, 2_000))
+        assertEquals(SignalLevel.STRONG, heard(iphone, -42).signalLevel)
     }
 
     @Test
-    fun aBeaconNoLongerHeardIsGone() {
-        val proximity = BeaconProximity()
-        proximity.update(listOf(at(loud, 0.3)))
-        assertEquals(emptySet<String>(), proximity.update(emptyList()))
+    fun aCalibrationNeverMakesItMoreLenientThanAStrongSignal() {
+        // Calibrated at 0.5 m with something in the way, the OnePlus read −64: that is about 2 m really.
+        assertEquals(STRONG_SIGNAL_DBM, heard(onePlus, -63).detectRssi)
+        assertEquals("not at −63", emptySet<String>(), BeaconDetector().hold(listOf(heard(onePlus, -63)), 0, 10_000))
+        assertEquals(setOf("BEACON_002"), BeaconDetector().hold(listOf(heard(onePlus, -53)), 0, 2_000))
+        assertEquals("a stricter calibration stays", -43, heard(iphone, -40).detectRssi)
+    }
+
+    @Test
+    fun onlyTheClearlyNearestBeaconIsDetected() {
+        // Both strong, about as near: neither is clearly the one the visitor is at.
+        assertEquals(emptySet<String>(), BeaconDetector().hold(listOf(heard(iphone, -42), heard(onePlus, -52)), 0, 10_000))
+        // The iPhone well ahead (6 dB or more over its threshold than the other): only it.
+        assertEquals(setOf("BEACON_001"), BeaconDetector().hold(listOf(heard(iphone, -40), heard(onePlus, -60)), 0, 2_000))
+    }
+
+    @Test
+    fun turningAroundKeepsTheBeaconDetected() {
+        val detector = BeaconDetector()
+        detector.hold(listOf(heard(iphone, -42)), 0, 2_000)
+        // Facing away: the body blocks the signal (−14 dB) for a long time, but the phone hasn't moved.
+        assertEquals(setOf("BEACON_001"), detector.hold(listOf(heard(iphone, -56)), 2_500, 20_000))
+    }
+
+    @Test
+    fun walkingAwayLosesTheBeacon() {
+        val detector = BeaconDetector()
+        detector.hold(listOf(heard(iphone, -42)), 0, 2_000)
+        assertEquals("1.2 m from where it was detected", emptySet<String>(), detector.update(listOf(heard(iphone, -44)), Vec3(1.2f, 1.3f, 0f), 2_500))
+    }
+
+    @Test
+    fun aWeakSignalAfterMovingABitLosesTheBeacon() {
+        val detector = BeaconDetector()
+        detector.hold(listOf(heard(iphone, -42)), 0, 2_000)
+        val stepped = Vec3(0.5f, 1.3f, 0f)
+        assertEquals("not yet", setOf("BEACON_001"), detector.hold(listOf(heard(iphone, -54)), 2_500, 4_000, stepped))
+        assertEquals(emptySet<String>(), detector.hold(listOf(heard(iphone, -54)), 4_500, 6_000, stepped))
+    }
+
+    @Test
+    fun aBeaconNotHeardForAWhileIsGone() {
+        val detector = BeaconDetector()
+        detector.hold(listOf(heard(iphone, -42)), 0, 2_000)
+        assertEquals(setOf("BEACON_001"), detector.hold(emptyList(), 2_500, 8_000))
+        assertEquals(emptySet<String>(), detector.hold(emptyList(), 8_500, 13_000))
+    }
+
+    @Test
+    fun aBeaconIsDetectedOnce() {
+        val detector = BeaconDetector()
+        assertEquals(setOf("BEACON_001"), detector.hold(listOf(heard(iphone, -42), heard(iphone, -41)), 0, 2_000))
+    }
+
+    @Test
+    fun withoutA05mCalibrationTheThresholdIsProjectedFrom1m() {
+        val only1m = iphone.copy(rssiAt05m = null)
+        assertEquals("−50 at 1 m: −42 at 0.5 m", -42, heard(only1m, -42).detectRssi)
+        assertTrue(!heard(only1m, -42).thresholdCalibrated)
+    }
+
+    @Test
+    fun anUncalibratedBeaconGetsACautiousThreshold() {
+        // It advertises −91 dBm at 1 m (a misconfigured beacon app): trusting that made it "within 0.5 m" at −79.
+        val uncalibrated = onePlus.copy(rssiAt1m = null, rssiAt05m = null)
+        fun signal(advertised: Int, rssi: Int) =
+            HeardBeacon(uncalibrated, NearbyDevice(BeaconIdentity.IBeacon(uuid, 2, 2, advertised), "AA", null, rssi, 5, 0L))
+        assertEquals("the same for every uncalibrated beacon", STRONG_SIGNAL_DBM, signal(-91, -79).detectRssi)
+        assertEquals(STRONG_SIGNAL_DBM, signal(-45, -79).detectRssi)
+        assertEquals(emptySet<String>(), BeaconDetector().hold(listOf(signal(-91, -79)), 0, 10_000))
+        assertEquals(setOf("BEACON_002"), BeaconDetector().hold(listOf(signal(-91, -54)), 0, 2_000))
+        assertEquals("a medium signal isn't enough", emptySet<String>(), BeaconDetector().hold(listOf(signal(-91, -62)), 0, 10_000))
+        assertTrue(!signal(-45, -54).isCalibrated)
+    }
+
+    @Test
+    fun aNonsenseAdvertisedStrengthIsIgnored() {
+        val uncalibrated = onePlus.copy(rssiAt1m = null, rssiAt05m = null)
+        val misconfigured = HeardBeacon(uncalibrated, NearbyDevice(BeaconIdentity.IBeacon(uuid, 2, 2, -91), "AA", null, -79, 5, 0L))
+        assertEquals(null, misconfigured.strengthAt1m)
+        assertEquals("judged against a usual beacon instead", SignalLevel.WEAK, misconfigured.signalLevel)
     }
 }

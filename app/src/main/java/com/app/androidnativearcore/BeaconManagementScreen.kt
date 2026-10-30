@@ -58,6 +58,7 @@ import com.app.androidnativearcore.ui.designkit.IosRowDivider
 import com.app.androidnativearcore.ui.designkit.IosSection
 import com.app.androidnativearcore.wayfinder.core.Beacons
 import com.app.androidnativearcore.wayfinder.core.RegisteredBeacon
+import com.app.androidnativearcore.wayfinder.core.STRONG_SIGNAL_DBM
 import com.app.androidnativearcore.wayfinder.core.Venue
 
 /**
@@ -221,7 +222,8 @@ fun BeaconManagementScreen(
                                 title = beacon.name,
                                 glyph = "📶",
                                 subtitle = beacon.identityLabel + (positionLabel(beacon)?.let { " · $it" } ?: " · found by signal") +
-                                    (beacon.rssiAt1m?.let { " · calibrated $it dBm" } ?: " · not calibrated"),
+                                    (beacon.rssiAt05m?.let { " · 0.5 m: $it dBm" } ?: " · 0.5 m not calibrated") +
+                                    (beacon.rssiAt1m?.let { " · 1 m: $it dBm" } ?: ""),
                                 onClick = { isNew = false; editing = beacon },
                             )
                             if (index < onFloor.lastIndex) IosRowDivider()
@@ -387,6 +389,9 @@ private fun BeaconEditor(
     var confirmDelete by remember { mutableStateOf(false) }
     // The beacon's signal 1 m away, measured here; and while measuring, the seconds left.
     var rssiAt1m by remember { mutableStateOf(initial.rssiAt1m) }
+    var rssiAt05m by remember { mutableStateOf(initial.rssiAt05m) }
+    // While measuring: at which distance (meters), and the seconds left.
+    var calibratingAt by remember { mutableStateOf<Float?>(null) }
     var calibrating by remember { mutableStateOf(0) }
     var calibrationNote by remember { mutableStateOf<String?>(null) }
 
@@ -394,7 +399,7 @@ private fun BeaconEditor(
     fun draft() = initial.copy(
         name = name, uuid = Beacons.normalizeUuid(uuid) ?: uuid, major = major.trim().toIntOrNull(),
         minor = minor.trim().toIntOrNull(), macAddress = Beacons.normalizeMac(mac) ?: mac, floorId = floorId,
-        x = x.trim().replace(',', '.').toFloatOrNull(), y = y.trim().replace(',', '.').toFloatOrNull(), rssiAt1m = rssiAt1m,
+        x = x.trim().replace(',', '.').toFloatOrNull(), y = y.trim().replace(',', '.').toFloatOrNull(), rssiAt1m = rssiAt1m, rssiAt05m = rssiAt05m,
     )
 
     // Calibrating: the phone is held 1 m from the beacon; its smoothed signal settles for a couple of seconds, then
@@ -411,10 +416,19 @@ private fun BeaconEditor(
         }
         calibrating = 0
         if (seen.size < CALIBRATE_MIN_READINGS) {
+            calibratingAt = null
             calibrationNote = "Not heard well enough. Check the beacon is on and its UUID (or address) is right, then try again."
         } else {
-            rssiAt1m = seen.sorted()[seen.size / 2]
-            calibrationNote = null
+            val measured = seen.sorted()[seen.size / 2]
+            if (calibratingAt == 0.5f) rssiAt05m = measured else rssiAt1m = measured
+            // At 0.5 m with a clear line between them, a beacon reads strong. Weaker says something was in the way.
+            calibrationNote = if (calibratingAt == 0.5f && measured < STRONG_SIGNAL_DBM) {
+                "Measured $measured dBm at 0.5 m: weaker than a strong signal ($STRONG_SIGNAL_DBM dBm), so the icon will " +
+                    "still need $STRONG_SIGNAL_DBM. Something may have been in the way: hold the phone 0.5 m from the beacon, " +
+                    "facing it with nothing between them, and calibrate again."
+            } else {
+                null
+            }
         }
     }
 
@@ -430,7 +444,7 @@ private fun BeaconEditor(
         val yValue = y.trim().ifEmpty { null }?.let { it.replace(',', '.').toFloatOrNull() ?: Float.NaN }
         val beacon = initial.copy(
             name = name.trim(), uuid = normalizedUuid, major = majorValue, minor = minorValue, macAddress = normalizedMac,
-            floorId = floorId, x = xValue, y = yValue, rssiAt1m = rssiAt1m,
+            floorId = floorId, x = xValue, y = yValue, rssiAt1m = rssiAt1m, rssiAt05m = rssiAt05m,
             createdAtMillis = if (isNew) System.currentTimeMillis() else initial.createdAtMillis,
         )
         val all = formatProblems + Beacons.problems(beacon, levels.map { it.id }.toSet(), others)
@@ -491,26 +505,33 @@ private fun BeaconEditor(
                 }
                 // Instead of measuring: stand next to the beacon and let the camera say where that is on the map.
                 TextButton(onClick = { onUsePosition(draft()) }) { Text("📍 Use my current position") }
-                Text("Signal at 1 m (calibration)", style = MaterialTheme.typography.labelLarge)
+                Text("Signal calibration", style = MaterialTheme.typography.labelLarge)
                 Text(
-                    rssiAt1m?.let { "$it dBm · calibrated" }
-                        ?: "Not calibrated: beacons differ in strength, so distances to this one are rough.",
+                    "0.5 m: " + (rssiAt05m?.let { "$it dBm" } ?: "not calibrated") + " · 1 m: " + (rssiAt1m?.let { "$it dBm" } ?: "not calibrated"),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    "Hold this phone 1 m from the beacon at chest height, keep still, and tap Calibrate.",
+                    "The beacon's icon shows only within 0.5 m of it, at a strong signal ($STRONG_SIGNAL_DBM dBm or stronger). " +
+                        "Calibrating at 0.5 m makes it exact for this beacon. Hold this phone at the distance from the beacon, " +
+                        "facing it with nothing in between, keep still, and tap the button (10 s).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                TextButton(
-                    enabled = calibrating == 0,
-                    onClick = {
-                        if (!scan.scanning) onStartScan()
-                        calibrationNote = null
-                        calibrating = (CALIBRATE_STEPS * CALIBRATE_STEP_MS / 1000).toInt()
-                    },
-                ) { Text(if (calibrating > 0) "Measuring… keep still (${calibrating}s)" else "📏 Calibrate at 1 m") }
+                for (meters in listOf(0.5f, 1f)) {
+                    val label = if (meters == 0.5f) "0.5 m" else "1 m"
+                    TextButton(
+                        enabled = calibrating == 0,
+                        onClick = {
+                            if (!scan.scanning) onStartScan()
+                            calibrationNote = null
+                            calibratingAt = meters
+                            calibrating = (CALIBRATE_STEPS * CALIBRATE_STEP_MS / 1000).toInt()
+                        },
+                    ) {
+                        Text(if (calibrating > 0 && calibratingAt == meters) "Measuring at $label… keep still (${calibrating}s)" else "📏 Calibrate at $label")
+                    }
+                }
                 calibrationNote?.let { Text("⚠ $it", color = Color(0xFFD32F2F), style = MaterialTheme.typography.bodySmall) }
                 for (problem in problems) Text("⚠ $problem", color = Color(0xFFD32F2F), style = MaterialTheme.typography.bodySmall)
                 if (!isNew) {
@@ -546,10 +567,13 @@ private fun positionLabel(beacon: RegisteredBeacon): String? {
     return "X %.1f, Y %.1f m".format(x, y)
 }
 
-/** Calibrating takes [CALIBRATE_STEPS] × [CALIBRATE_STEP_MS] (8 s): the first [CALIBRATE_SETTLE_STEPS] let the smoothed signal settle. */
-private const val CALIBRATE_STEPS = 32
+/**
+ * Calibrating takes [CALIBRATE_STEPS] × [CALIBRATE_STEP_MS] (10 s): the first [CALIBRATE_SETTLE_STEPS] (4 s, the length
+ * of the signal's smoothing) let readings from before the phone was held still drop out.
+ */
+private const val CALIBRATE_STEPS = 40
 private const val CALIBRATE_STEP_MS = 250L
-private const val CALIBRATE_SETTLE_STEPS = 8
+private const val CALIBRATE_SETTLE_STEPS = 16
 
 /** Fewest readings of the beacon for a calibration to count. */
 private const val CALIBRATE_MIN_READINGS = 8

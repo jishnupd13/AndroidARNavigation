@@ -41,17 +41,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.app.androidnativearcore.wayfinder.core.BeaconFix
 import com.app.androidnativearcore.wayfinder.core.BeaconPosition
-import com.app.androidnativearcore.wayfinder.core.BeaconProximity
+import com.app.androidnativearcore.wayfinder.core.BeaconDetector
+import com.app.androidnativearcore.wayfinder.core.SignalLevel
 import com.app.androidnativearcore.wayfinder.core.BeaconReading
+import com.app.androidnativearcore.wayfinder.core.isCalibrated
 import com.app.androidnativearcore.wayfinder.core.HeardBeacon
 import com.app.androidnativearcore.wayfinder.core.ProximityTrend
 import com.app.androidnativearcore.wayfinder.core.RegisteredBeacon
 import com.app.androidnativearcore.wayfinder.core.Vec3
-import com.app.androidnativearcore.wayfinder.core.distanceMeters
+import com.app.androidnativearcore.wayfinder.core.detectRssi
+import com.app.androidnativearcore.wayfinder.core.signalLevel
+import com.app.androidnativearcore.wayfinder.core.thresholdCalibrated
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.matches
 import com.app.androidnativearcore.wayfinder.core.position
+import com.google.ar.core.Anchor
 import com.google.ar.core.Config
+import com.google.ar.core.Pose
+import com.google.ar.core.Session
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
 import com.google.ar.core.TrackingState
@@ -75,13 +82,17 @@ private val furtherOrange = Color(0xFFFF9F0A)
  * "Closer" comes from the target beacon's own signal getting stronger. When both the visitor's position and the
  * target's are known (beacons registered with X and Y), the straight-line distance is shown and used instead.
  *
- * A beacon's logo follows two rules ([BeaconProximity]):
- * 1. Signal strength decides: the logo shows when the beacon's signal says it is within 0.5 m of the phone.
- * 2. Only within that radius: it hides as soon as the signal says the phone is farther, and nothing is remembered
- *    (walk away, or move the beacon, and it is gone until the phone is within 0.5 m of it again).
- * Within 0.5 m the beacon is practically at the phone, so that is where the logo is drawn: on the surface the camera
- * points at when that is within the radius (the desk the beacon lies on), else just in front of the camera.
- * Bluetooth can't tell direction, so the logo is never put farther away than the radius.
+ * A beacon's icon follows three rules:
+ * 1. Detection by signal strength: a beacon merely heard is not detected; its filtered signal must reach its 0.5 m
+ *    threshold (calibrated at 0.5 m by the admin) and hold there ([BeaconDetector]).
+ * 2. The icon shows only while the beacon is detected, within about 0.5 m: never for a weak or medium signal. It
+ *    hides when the visitor walks away.
+ * 3. Turning around doesn't move or lose it: detection stays while the phone stays put (the camera tracks it), and
+ *    the icon is pinned to the room with an AR anchor. Detected again from about the same spot in this session, it
+ *    goes to the same place, once. Its first place is where the camera points within 0.5 m (the desk the beacon
+ *    lies on), else just in front of the camera: Bluetooth can't tell direction, so the visitor faces the beacon
+ *    when first detecting it. Across sessions the place isn't kept: that needs a registered position in a frame the
+ *    camera can find again (cloud anchors or reference points).
  */
 @Composable
 fun WayFinderBeaconPathScreen(
@@ -102,7 +113,9 @@ fun WayFinderBeaconPathScreen(
 ) {
     var targetId by rememberSaveable { mutableStateOf<String?>(null) }
     val target = beacons.firstOrNull { it.beaconId == targetId }
-    val arrived = target != null && fix?.beacon?.beaconId == target.beaconId
+    // The beacons detected within 0.5 m (rule 1–2): arriving means detecting the target, not merely hearing it best.
+    var detected by remember { mutableStateOf(emptySet<String>()) }
+    val arrived = target != null && target.beaconId in detected
     // How far the target is: a straight-line distance when both positions are known, else its signal strength.
     val distance = target?.let { t -> t.position?.let { spot -> position?.takeIf { it.floorId == t.floorId }?.position?.distanceTo(spot) } }
     val targetSignal = heard.firstOrNull { it.beacon.beaconId == targetId }
@@ -132,32 +145,46 @@ fun WayFinderBeaconPathScreen(
     // Why the camera doesn't know where it is ("too dark"…), or null: a logo can't be drawn in place until it does.
     var trackingMessage by remember { mutableStateOf<String?>("Starting the camera… move the phone slowly.") }
 
-    // The beacons within 0.5 m by their signal, and where each one's logo is drawn while it is.
-    val proximity = remember { BeaconProximity() }
+    // Rules 1–2: which beacons are detected within 0.5 m, by their filtered signal ([BeaconDetector]); turning around
+    // on the spot doesn't lose one, walking away does. Rule 3: each beacon's icon is pinned to the room with an AR
+    // anchor for this session; detected again from about the same spot, it reuses that place (turning around and
+    // scanning again shows it where it was, once), instead of placing it again by the camera's direction.
+    val detector = remember { BeaconDetector() }
     val logos = remember { mutableStateMapOf<String, Vec3>() }
+    val placements = remember { mutableMapOf<String, Placement>() }
+    val arSession = remember { arrayOfNulls<Session>(1) }
     val currentHeard by rememberUpdatedState(heard)
     LaunchedEffect(Unit) {
         while (true) {
-            delay(PROXIMITY_EVERY_MS)
-            val within = proximity.update(currentHeard)
-            for (id in logos.keys.toList()) {
-                if (id in within) continue
-                logos.remove(id)
-                Log.i(SPOT_TAG, "hide $session $id: farther than ${BeaconProximity.HIDE_BEYOND_M} m")
+            delay(DETECT_EVERY_MS)
+            val now = SystemClock.elapsedRealtime()
+            val phone = if (tracking[0]) Vec3(camera[0], camera[1], camera[2]) else null
+            val nowDetected = detector.update(currentHeard, phone, now)
+            if (nowDetected != detected) {
+                for (id in detected - nowDetected) Log.i(SPOT_TAG, "lost $session $id")
+                detected = nowDetected
             }
-            if (!tracking[0]) continue
-            for (id in within) {
+            for (id in logos.keys.toList()) if (id !in nowDetected) logos.remove(id)
+            if (phone == null) continue // an icon can't be put in place until the camera knows where it is
+            for (id in nowDetected) {
                 if (id in logos) continue
-                val phone = Vec3(camera[0], camera[1], camera[2])
-                val surface = if (aim[3] == 1f) Vec3(aim[0], aim[1], aim[2]) else null
-                val spot = logoSpot(phone, Vec3(forward[0], forward[1], forward[2]), surface)
+                val signal = currentHeard.firstOrNull { it.beacon.beaconId == id }
+                val earlier = placements[id]?.takeIf { hypot(it.from.x - phone.x, it.from.z - phone.z) <= SAME_SPOT_M }
+                val spot = if (earlier != null) {
+                    earlier.spot
+                } else {
+                    val surface = if (aim[3] == 1f) Vec3(aim[0], aim[1], aim[2]) else null
+                    val placed = logoSpot(phone, Vec3(forward[0], forward[1], forward[2]), surface)
+                    placements.remove(id)?.anchor?.detach()
+                    val anchor = arSession[0]?.let { s -> runCatching { s.createAnchor(Pose.makeTranslation(placed.x, placed.y, placed.z)) }.getOrNull() }
+                    placements[id] = Placement(anchor, placed, phone)
+                    placed
+                }
                 logos[id] = spot
-                val meters = currentHeard.firstOrNull { it.beacon.beaconId == id }?.distanceMeters
                 Log.i(
                     SPOT_TAG,
-                    "show $session $id at %.2f m by signal, logo %.2f %.2f %.2f %s".format(
-                        meters ?: Float.NaN, spot.x, spot.y, spot.z, if (spot == surface) "on surface" else "in front",
-                    ),
+                    "detected $session $id rssi=${signal?.rssi} threshold=${signal?.detectRssi}${if (signal?.thresholdCalibrated == true) "" else " (projected)"}" +
+                        " icon %.2f %.2f %.2f %s".format(spot.x, spot.y, spot.z, if (earlier != null) "same place as before" else "placed"),
                 )
             }
         }
@@ -182,7 +209,11 @@ fun WayFinderBeaconPathScreen(
 
     DisposableEffect(view) {
         view.keepScreenOn = true
-        onDispose { view.keepScreenOn = false }
+        onDispose {
+            view.keepScreenOn = false
+            placements.values.forEach { it.anchor?.detach() }
+            placements.clear()
+        }
     }
     BackHandler(onBack = onClose)
 
@@ -198,7 +229,8 @@ fun WayFinderBeaconPathScreen(
                 config.depthMode = Config.DepthMode.DISABLED
             },
             planeRenderer = false,
-            onSessionUpdated = { arSession, frame ->
+            onSessionUpdated = { session, frame ->
+                arSession[0] = session
                 val pose = frame.camera.pose
                 camera[0] = pose.tx(); camera[1] = pose.ty(); camera[2] = pose.tz()
                 // The camera looks along its −z axis.
@@ -216,11 +248,24 @@ fun WayFinderBeaconPathScreen(
                         }
                     }
                     val spot = hit?.hitPose?.let { Vec3(it.tx(), it.ty(), it.tz()) }
-                        ?: surfaceAhead(arSession.getAllTrackables(Plane::class.java), Vec3(camera[0], camera[1], camera[2]), Vec3(forward[0], forward[1], forward[2]))
+                        ?: surfaceAhead(session.getAllTrackables(Plane::class.java), Vec3(camera[0], camera[1], camera[2]), Vec3(forward[0], forward[1], forward[2]))
                     if (spot != null) {
                         aim[0] = spot.x; aim[1] = spot.y; aim[2] = spot.z; aim[3] = 1f
                     } else {
                         aim[3] = 0f
+                    }
+                }
+                // The camera corrects its map of the room as it learns it: the anchors, and the icons on them, move along.
+                if (tracking[0] && frameCount[0] % 10 == 1) {
+                    for ((id, placement) in placements) {
+                        val anchor = placement.anchor ?: continue
+                        if (anchor.trackingState != TrackingState.TRACKING) continue
+                        val p = anchor.pose
+                        val spot = Vec3(p.tx(), p.ty(), p.tz())
+                        if (spot.distanceTo(placement.spot) > 0.01f) {
+                            placement.spot = spot
+                            if (id in logos) logos[id] = spot
+                        }
                     }
                 }
                 val message = ArMarkerTracker.trackingMessage(frame)
@@ -250,24 +295,34 @@ fun WayFinderBeaconPathScreen(
                         "Hold the phone and walk slowly. Beacons are found automatically by their signal.",
                     ),
                 )
-                else -> GuidanceBannerView(
-                    GuidanceBanner(
-                        "You're near ${fix.beacon.name}", "📶",
-                        listOf(floorName(fix.beacon.floorId), fix.howNear, "${fix.rssi} dBm").joinToString(" · "),
-                    ),
-                )
+                else -> {
+                    val at = beacons.firstOrNull { it.beaconId in detected && (target == null || it.beaconId == target.beaconId) }
+                        ?: beacons.firstOrNull { it.beaconId in detected }
+                    val level = heard.firstOrNull { it.beacon.beaconId == fix.beacon.beaconId }?.signalLevel
+                    GuidanceBannerView(
+                        if (at != null) {
+                            GuidanceBanner("At ${at.name}", "📍", "Within 0.5 m · ${floorName(at.floorId)}")
+                        } else {
+                            GuidanceBanner(
+                                "Nearest beacon signal: ${fix.beacon.name}", "📶",
+                                listOfNotNull(floorName(fix.beacon.floorId), level?.let(::levelWord), "${fix.rssi} dBm").joinToString(" · "),
+                            )
+                        },
+                    )
+                }
             }
             // The beacon being walked to, else the nearest: whether its logo shows, and how to make it show.
             (target ?: fix?.beacon)?.takeIf { !arrived || it.beaconId !in logos }?.let { beacon ->
                 val signal = heard.firstOrNull { it.beacon.beaconId == beacon.beaconId }
+                val approximate = when {
+                    signal == null || signal.thresholdCalibrated -> ""
+                    signal.isCalibrated -> " (from the 1 m calibration: approximate)"
+                    else -> " (not calibrated: approximate; calibrate at 0.5 m for accuracy)"
+                }
                 val status = when {
-                    beacon.beaconId in logos -> "✓ ${beacon.name} is here, within 0.5 m"
-                    trackingMessage != null && signal != null && signal.distanceMeters <= BeaconProximity.SHOW_WITHIN_M ->
-                        "📷 $trackingMessage Hold the phone up, facing the room."
-                    signal != null -> "📍 ${beacon.name}: " +
-                        (calibratedDistance(signal)?.let { distanceText(it) + " away · " } ?: "") +
-                        "its logo shows within 0.5 m of it" +
-                        (if (beacon.rssiAt1m == null) " (not calibrated: 0.5 m is approximate)" else "")
+                    beacon.beaconId in logos -> "✓ ${beacon.name}: within 0.5 m$approximate"
+                    beacon.beaconId in detected && trackingMessage != null -> "📷 $trackingMessage Hold the phone up, facing the room."
+                    signal != null -> "📍 ${beacon.name}: ${levelWord(signal.signalLevel)} · its icon shows only within 0.5 m$approximate"
                     else -> null
                 } ?: return@let
                 Text(
@@ -289,7 +344,7 @@ fun WayFinderBeaconPathScreen(
             ToastHost(toast)
             if (problem == null && beacons.isNotEmpty()) {
                 if (target == null) {
-                    BeaconPicker(beacons, fix, position, heard, ::floorName, onPick = { targetId = it.beaconId })
+                    BeaconPicker(beacons, detected, position, heard, ::floorName, onPick = { targetId = it.beaconId })
                 } else if (!arrived) {
                     GoingTo(
                         target, distance, targetSignal, direction, floorName(target.floorId),
@@ -306,8 +361,24 @@ fun WayFinderBeaconPathScreen(
     }
 }
 
-/** How often (ms) the beacons within 0.5 m are checked. */
-private const val PROXIMITY_EVERY_MS = 500L
+/** How often (ms) the detections are updated. */
+private const val DETECT_EVERY_MS = 500L
+
+/** Detected again within this distance (meters) of where its icon was placed from: the icon goes to the same place. */
+private const val SAME_SPOT_M = 1f
+
+/** Where a beacon's icon was put in this session: its AR anchor, the spot (kept up with the anchor), and from where. */
+private class Placement(val anchor: Anchor?, var spot: Vec3, val from: Vec3)
+
+/** A signal level in words. Only a strong signal (within 0.5 m) shows the icon. */
+private fun levelWord(level: SignalLevel) = when (level) {
+    SignalLevel.STRONG -> "strong signal"
+    SignalLevel.MEDIUM -> "medium signal"
+    SignalLevel.WEAK -> "weak signal"
+}
+
+/** A detected beacon is within this distance (meters) of the phone: its icon is never put farther. */
+private const val ICON_RADIUS_M = 0.5f
 
 /** With no surface to put the logo on, it is drawn this far (meters) in front of the camera, a bit below it. */
 private const val LOGO_AHEAD_M = 0.45f
@@ -325,7 +396,7 @@ private const val SPOT_TAG = "WFBeaconSpot"
  * that is within the radius (the desk the beacon lies on), else [LOGO_AHEAD_M] in front of the camera.
  */
 private fun logoSpot(phone: Vec3, forward: Vec3, surface: Vec3?): Vec3 {
-    if (surface != null && hypot(surface.x - phone.x, surface.z - phone.z) <= BeaconProximity.SHOW_WITHIN_M) return surface
+    if (surface != null && hypot(surface.x - phone.x, surface.z - phone.z) <= ICON_RADIUS_M) return surface
     val flat = hypot(forward.x, forward.z).coerceAtLeast(1e-3f)
     return Vec3(phone.x + forward.x / flat * LOGO_AHEAD_M, phone.y - LOGO_BELOW_M, phone.z + forward.z / flat * LOGO_AHEAD_M)
 }
@@ -378,7 +449,7 @@ private fun Arrived(target: RegisteredBeacon, floor: String, shown: Boolean, onD
 @Composable
 private fun BeaconPicker(
     beacons: List<RegisteredBeacon>,
-    fix: BeaconFix?,
+    detected: Set<String>,
     position: BeaconPosition?,
     heard: List<HeardBeacon>,
     floorName: (String) -> String,
@@ -391,7 +462,7 @@ private fun BeaconPicker(
         Text("Where do you want to go?", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         LazyColumn(Modifier.heightIn(max = 240.dp)) {
             items(sorted, key = { it.beaconId }) { beacon ->
-                val here = fix?.beacon?.beaconId == beacon.beaconId
+                val here = beacon.beaconId in detected
                 val meters = beacon.position?.let { spot -> position?.takeIf { it.floorId == beacon.floorId }?.position?.distanceTo(spot) }
                 val signal = signals[beacon.beaconId]
                 Row(
@@ -404,9 +475,9 @@ private fun BeaconPicker(
                     }
                     Text(
                         when {
-                            here -> "You're here"
+                            here -> "within 0.5 m"
                             meters != null -> distanceText(meters)
-                            signal != null -> calibratedDistance(signal)?.let(::distanceText) ?: signalWord(signal.rssi)
+                            signal != null -> calibratedDistance(signal)?.let(::distanceText) ?: levelWord(signal.signalLevel)
                             else -> "not heard"
                         },
                         color = if (here) closerGreen else Color.White.copy(alpha = 0.8f),
@@ -449,7 +520,7 @@ private fun GoingTo(
                         Text(distanceText(meters) + " away", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
                         Text("From its signal (${signal.rssi} dBm), as calibrated", color = Color.White.copy(alpha = 0.75f), fontSize = 13.sp)
                     } else {
-                        Text(signalWord(signal.rssi).replaceFirstChar { it.uppercase() }, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                        Text(levelWord(signal.signalLevel).replaceFirstChar { it.uppercase() }, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
                         Text("${signal.rssi} dBm: the stronger the signal, the closer you are", color = Color.White.copy(alpha = 0.75f), fontSize = 13.sp)
                     }
                 }
@@ -468,11 +539,3 @@ private fun distanceText(meters: Float) = if (meters < 1f) "less than 1 m" else 
 
 /** The distance from a beacon's signal when the admin calibrated it (then it means something), else null. */
 private fun calibratedDistance(signal: HeardBeacon): Float? = signal.takeIf { it.beacon.rssiAt1m != null }?.roughDistanceMeters
-
-/** A beacon's signal in words. Beacons differ in strength, so this is a rough guide, not a distance. */
-private fun signalWord(rssi: Int) = when {
-    rssi >= -60 -> "strong signal"
-    rssi >= -75 -> "good signal"
-    rssi >= -88 -> "weak signal"
-    else -> "very weak signal"
-}
