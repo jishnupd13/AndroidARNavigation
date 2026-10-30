@@ -32,6 +32,7 @@ import com.app.androidnativearcore.wayfinder.core.RegisteredBeacon
 import com.app.androidnativearcore.wayfinder.core.Vec3
 import com.app.androidnativearcore.wayfinder.core.Venue
 import com.app.androidnativearcore.wayfinder.core.WalkedPoint
+import com.app.androidnativearcore.wayfinder.core.position
 import kotlin.math.hypot
 
 /** The user on the map: a dot at their position in venue coordinates. */
@@ -83,7 +84,10 @@ fun FloorMap(
     val runs = remember(points) { points.groupBy { it.run }.values.map { run -> run.sortedBy { it.sequence } } }
     val levelPois = remember(level, destinations) { destinations.filter { it.level == level } }
     val levelMarkers = remember(level, markers) { markers.filter { it.level == level } }
-    val levelBeacons = remember(level, beacons) { beacons.filter { it.floorId == level } }
+    // Only beacons with a known position can be drawn, each with its spot.
+    val levelBeacons = remember(level, beacons) {
+        beacons.filter { it.floorId == level }.mapNotNull { b -> b.position?.let { b to it } }
+    }
 
     // Everything that should be in view at the start.
     val bounds = remember(points, levelPois, levelMarkers, levelBeacons, user, route) {
@@ -91,7 +95,7 @@ fun FloorMap(
         points.forEach { xs += it.x; zs += it.z }
         levelPois.forEach { xs += it.x; zs += it.z }
         levelMarkers.forEach { xs += it.x; zs += it.z }
-        levelBeacons.forEach { xs += it.x; zs += it.y }
+        levelBeacons.forEach { (_, spot) -> xs += spot.x; zs += spot.z }
         user?.let { xs += it.x; zs += it.z }
         route?.forEach { xs += it.x; zs += it.z }
         if (xs.isEmpty()) floatArrayOf(-5f, 5f, -5f, 5f)
@@ -131,10 +135,10 @@ fun FloorMap(
                     fun gap(x: Float, z: Float) = toScreen(size, x, z).let { hypot(it.x - tap.x, it.y - tap.y) }
                     // Whichever pin or beacon is nearest the tap, if it is close enough.
                     val poi = levelPois.minByOrNull { gap(it.x, it.z) }
-                    val beacon = levelBeacons.minByOrNull { gap(it.x, it.y) }
+                    val beacon = levelBeacons.minByOrNull { (_, spot) -> gap(spot.x, spot.z) }
                     val poiGap = poi?.let { gap(it.x, it.z) } ?: Float.MAX_VALUE
-                    val beaconGap = beacon?.let { gap(it.x, it.y) } ?: Float.MAX_VALUE
-                    if (beaconGap < poiGap) beacon?.takeIf { beaconGap <= tapRadiusPx }?.let(selectBeacon)
+                    val beaconGap = beacon?.let { (_, spot) -> gap(spot.x, spot.z) } ?: Float.MAX_VALUE
+                    if (beaconGap < poiGap) beacon?.takeIf { beaconGap <= tapRadiusPx }?.let { selectBeacon(it.first) }
                     else poi?.takeIf { poiGap <= tapRadiusPx }?.let(select)
                 }
             },
@@ -206,8 +210,8 @@ fun FloorMap(
             fun diamond(c: Offset, r: Float) = Path().apply {
                 moveTo(c.x, c.y - r); lineTo(c.x + r, c.y); lineTo(c.x, c.y + r); lineTo(c.x - r, c.y); close()
             }
-            for (beacon in levelBeacons) {
-                val c = at(beacon.x, beacon.y)
+            for ((beacon, spot) in levelBeacons) {
+                val c = at(spot.x, spot.z)
                 if (beacon.beaconId == selectedId) drawCircle(beaconColor.copy(alpha = 0.25f), 20f * unit, c)
                 else if (beacon.beaconId == nearBeaconId) drawCircle(beaconColor.copy(alpha = 0.15f), 16f * unit, c)
                 drawPath(diamond(c, 11f * unit), Color.White)

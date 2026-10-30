@@ -4,6 +4,7 @@ import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.app.androidnativearcore.wayfinder.core.BeaconReading
 import com.app.androidnativearcore.wayfinder.core.NearbyDevice
 import com.app.androidnativearcore.wayfinder.core.NearbyDevices
 
@@ -12,7 +13,11 @@ import com.app.androidnativearcore.wayfinder.core.NearbyDevices
  * The list is refreshed by [refresh] (called on a timer while scanning), not on every advertisement, so the screen
  * redraws a couple of times a second instead of dozens.
  */
-class NearbyScan(private val scanner: BleScanner) {
+class NearbyScan(
+    private val scanner: BleScanner,
+    /** Also gets every advertisement as it is heard (on the main thread), unsmoothed. */
+    private val onEachReading: (BeaconReading) -> Unit = {},
+) {
     private val nearby = NearbyDevices()
 
     var devices by mutableStateOf<List<NearbyDevice>>(emptyList())
@@ -30,7 +35,13 @@ class NearbyScan(private val scanner: BleScanner) {
 
     fun start() {
         error = null
-        problem = scanner.start(onReading = nearby::add, onError = { error = it; scanning = false })
+        problem = scanner.start(
+            onReading = { reading ->
+                nearby.add(reading)
+                onEachReading(reading)
+            },
+            onError = { error = it; scanning = false },
+        )
         scanning = problem == null
     }
 

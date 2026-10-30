@@ -52,7 +52,26 @@ class BeaconsTest {
         assertTrue(Beacons.problems(beacon(uuid = "", major = null, minor = null), floors, emptyList()).any { "UUID" in it })
         assertTrue(Beacons.problems(beacon(minor = null), floors, emptyList()).any { "Major and Minor" in it })
         assertTrue(Beacons.problems(beacon(major = 70_000), floors, emptyList()).any { "between 0" in it })
-        assertTrue(Beacons.problems(beacon().copy(x = Float.NaN), floors, emptyList()).any { "X and Y" in it })
+        assertTrue(Beacons.problems(beacon().copy(x = null), floors, emptyList()).any { "both X and Y" in it })
+        assertTrue(Beacons.problems(beacon().copy(x = Float.NaN), floors, emptyList()).any { "numbers" in it })
+    }
+
+    @Test
+    fun aBeaconWithoutAPositionCanBeSaved() {
+        // Registered without a reference point: found by its signal alone.
+        val unplaced = beacon().copy(x = null, y = null)
+        assertTrue(Beacons.problems(unplaced, floors, emptyList()).isEmpty())
+        assertTrue(!unplaced.hasPosition)
+        assertNull(unplaced.position)
+        assertNull(unplaced.routeEndpoint())
+
+        // Saved and read back without a position.
+        val dir = Files.createTempDirectory("beacons").toFile()
+        BeaconStore(dir).save(unplaced.copy(buildingId = "demo-mall"))
+        val loaded = BeaconStore(dir).load("demo-mall").single()
+        assertNull(loaded.x)
+        assertNull(loaded.y)
+        dir.deleteRecursively()
     }
 
     @Test
@@ -104,7 +123,7 @@ class BeaconsTest {
         assertEquals("BEACON_001", loaded.beaconId)
         assertEquals(1, loaded.major)
         assertEquals("", loaded.macAddress)
-        assertEquals(2.5f, loaded.x, 0f)
-        assertEquals(4.0f, loaded.y, 0f)
+        assertEquals(2.5f, loaded.x!!, 0f)
+        assertEquals(4.0f, loaded.y!!, 0f)
     }
 }

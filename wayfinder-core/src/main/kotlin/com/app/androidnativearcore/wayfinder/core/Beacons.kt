@@ -9,7 +9,8 @@ import kotlinx.serialization.json.Json
  *
  * The field names follow the shared beacon format (`beaconId`, `uuid`, `major`, `minor`, `floorId`, `x`, `y`) so the
  * same file can be read by other apps. [x] and [y] are floor-plan coordinates in meters: [x] is the venue's x and
- * [y] the venue's z (in the venue's 3D frame, y is height).
+ * [y] the venue's z (in the venue's 3D frame, y is height). They are optional: a beacon registered without a
+ * reference point has no position, and is then found by its signal alone (no 2D map, routes or AR marker for it).
  *
  * Not every beacon advertises the same things: an iBeacon has a [uuid], [major] and [minor]; other beacons may only
  * show a Bluetooth address ([macAddress]), and many change that address regularly. So every identifier is optional,
@@ -29,12 +30,22 @@ data class RegisteredBeacon(
     val buildingId: String = "",
     /** The floor it is on: a [Venue.Level] id. */
     val floorId: String,
-    val x: Float,
-    val y: Float,
+    /** Floor-plan position (meters), or null when it isn't known. */
+    val x: Float? = null,
+    val y: Float? = null,
     val createdAtMillis: Long = 0L,
+    /**
+     * The beacon's signal measured 1 m away when the admin calibrated it (dBm), or null. Beacons differ a lot in
+     * strength (a phone acting as a beacon may be much louder or quieter than what it advertises), so this is what
+     * makes distances, and so which beacon is nearest, comparable between beacons.
+     */
+    val rssiAt1m: Int? = null,
 ) {
     /** True if the beacon carries at least one identifier the app can recognize it by. */
     val identifies: Boolean get() = uuid.isNotEmpty() || macAddress.isNotEmpty()
+
+    /** True if the beacon's spot on the floor plan is known. */
+    val hasPosition: Boolean get() = x != null && y != null
 
     /** "UUID · 1 · 2" (iBeacon) or the address, for showing which beacon this is. */
     val identityLabel: String
@@ -59,6 +70,10 @@ object Beacons {
 
     /** Largest value of an iBeacon major or minor (16 bits). */
     const val MAX_MAJOR_MINOR = 65_535
+
+    /** The range a beacon's signal 1 m away can sensibly be calibrated to (dBm). */
+    const val MIN_RSSI_AT_1M = -100
+    const val MAX_RSSI_AT_1M = -20
 
     /**
      * [text] as a canonical UUID (`E2C56DB5-DFFB-48D2-B060-D0F5A71096E0`), accepting any case and with or without
@@ -92,7 +107,12 @@ object Beacons {
         for (value in listOfNotNull(beacon.major, beacon.minor)) {
             if (value !in 0..MAX_MAJOR_MINOR) out += "Major and Minor must be between 0 and $MAX_MAJOR_MINOR."
         }
-        if (!beacon.x.isFinite() || !beacon.y.isFinite()) out += "Enter the beacon's X and Y position in meters."
+        // The position is optional, but half a position (or a broken number) is a mistake.
+        if ((beacon.x == null) != (beacon.y == null)) out += "Enter both X and Y, or leave both empty."
+        if (listOfNotNull(beacon.x, beacon.y).any { !it.isFinite() }) out += "X and Y must be numbers in meters."
+        if (beacon.rssiAt1m != null && beacon.rssiAt1m !in MIN_RSSI_AT_1M..MAX_RSSI_AT_1M) {
+            out += "The calibrated signal must be between $MIN_RSSI_AT_1M and $MAX_RSSI_AT_1M dBm."
+        }
         others.firstOrNull { it.beaconId != beacon.beaconId && it.sameDeviceAs(beacon) }?.let {
             out += "This beacon is already registered as “${it.name}”."
         }

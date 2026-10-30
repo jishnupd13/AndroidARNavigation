@@ -102,7 +102,10 @@ data class NearbyDevice(
      * bodies and the phone's orientation change the signal a lot, so this is only "near" or "far", not a measurement.
      */
     val roughDistanceMeters: Float?
-        get() = identity.txPowerAt1m?.let { tx -> 10.0.pow((tx - rssi) / (10.0 * PATH_LOSS_EXPONENT)).toFloat() }
+        get() = identity.txPowerAt1m?.let(::roughDistanceFor)
+
+    /** The rough distance in meters if the beacon's signal strength at 1 m were [txAt1m] dBm. */
+    fun roughDistanceFor(txAt1m: Int): Float = 10.0.pow((txAt1m - rssi) / (10.0 * PATH_LOSS_EXPONENT)).toFloat()
 
     private companion object {
         /** How fast a signal weakens with distance indoors (2 in open space; 2–3 inside buildings). */
@@ -159,8 +162,11 @@ class NearbyDevices {
     }
 }
 
-/** True if [device] is the beacon [registered]: same iBeacon identity, or the same address for other devices. */
-fun RegisteredBeacon.matches(device: NearbyDevice): Boolean = when (val id = device.identity) {
-    is BeaconIdentity.IBeacon -> uuid == id.uuid && major == id.major && minor == id.minor
-    else -> uuid.isEmpty() && macAddress.isNotEmpty() && macAddress.equals(device.address, ignoreCase = true)
+/** True if [device] is this registered beacon: same iBeacon identity, or the same address for other devices. */
+fun RegisteredBeacon.matches(device: NearbyDevice): Boolean = matches(device.identity, device.address)
+
+/** True if an advertisement from [identity] at [address] is this registered beacon (as for a [NearbyDevice]). */
+fun RegisteredBeacon.matches(identity: BeaconIdentity, address: String): Boolean = when (identity) {
+    is BeaconIdentity.IBeacon -> uuid == identity.uuid && major == identity.major && minor == identity.minor
+    else -> uuid.isEmpty() && macAddress.isNotEmpty() && macAddress.equals(address, ignoreCase = true)
 }

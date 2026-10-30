@@ -75,6 +75,7 @@ import com.app.androidnativearcore.ui.designkit.IosRowDivider
 import com.app.androidnativearcore.ui.designkit.IosSection
 import com.app.androidnativearcore.wayfinder.ar.LocatedUser
 import com.app.androidnativearcore.wayfinder.ar.NavigationFeedback
+import com.app.androidnativearcore.wayfinder.ar.WayFinderBeaconPathScreen
 import com.app.androidnativearcore.wayfinder.ar.WayFinderCaptureScreen
 import com.app.androidnativearcore.wayfinder.ar.WayFinderLocateScreen
 import com.app.androidnativearcore.wayfinder.ar.WayFinderNavigationListener
@@ -115,6 +116,8 @@ private sealed interface Screen {
     data object Locate : Screen
     /** User flow, step 2: every other point reachable from where the user stands. */
     data class Nearby(val located: LocatedUser?) : Screen
+    /** User flow without a reference point: the camera, with Bluetooth beacons guiding to a chosen beacon. */
+    data object BeaconPath : Screen
     /** [from] is where the user was found, when they came through the user flow; they return there afterwards. */
     data class Navigate(val poi: Venue.POI, val profile: RouteProfile, val from: LocatedUser? = null) : Screen
 }
@@ -261,7 +264,7 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
         }
     }
     val onUserScreen = mode == AppMode.USER &&
-        (screen == Screen.List || screen == Screen.Locate || screen is Screen.Nearby || screen is Screen.Navigate)
+        (screen == Screen.List || screen == Screen.Locate || screen is Screen.Nearby || screen is Screen.Navigate || screen == Screen.BeaconPath)
     val locating = onUserScreen && appVisible && beacons.isNotEmpty()
     val registeredBeacons by rememberUpdatedState(beacons)
     LaunchedEffect(locating) {
@@ -295,6 +298,18 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
             null -> beaconLocator.start()
         }
     }
+    /** Why the beacons can't be heard, for the Beacon path screen, or null. */
+    fun beaconProblemText(): String? = when {
+        beacons.isEmpty() -> "No beacons are registered yet. The admin registers them in Bluetooth Beacon Management."
+        else -> when (beaconLocator.problem) {
+            BleScanner.Problem.BLUETOOTH_OFF -> "Turn on Bluetooth to find where you are."
+            BleScanner.Problem.LOCATION_OFF -> "Turn on location: Android needs it to scan for beacons."
+            BleScanner.Problem.PERMISSION_MISSING -> "Allow the app to find nearby Bluetooth devices."
+            BleScanner.Problem.NO_BLUETOOTH_LE -> "This phone can't use Bluetooth beacons."
+            null -> null
+        }
+    }
+
     /** "Near <beacon> · <floor>" for the scan screen, or null while no registered beacon is heard. */
     fun beaconHint(): String? = beaconLocator.fix?.let { fix ->
         val floor = pkg.venue.level(fix.beacon.floorId)?.name?.resolved() ?: fix.beacon.floorId
@@ -313,6 +328,19 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
             onReferenceSizeMeasured = ::saveMeasuredSize,
             beaconHint = beaconHint(),
         )
+        Screen.BeaconPath -> WayFinderBeaconPathScreen(
+            venue = pkg.venue,
+            beacons = beacons,
+            fix = beaconLocator.fix,
+            position = beaconLocator.position,
+            heard = beaconLocator.heard,
+            listenToReadings = beaconLocator::listenToReadings,
+            problem = beaconProblemText(),
+            onFixProblem = ::fixBeaconAccess.takeIf {
+                beacons.isNotEmpty() && beaconLocator.problem != BleScanner.Problem.NO_BLUETOOTH_LE
+            },
+            onClose = { screen = Screen.List },
+        )
         is Screen.Nearby -> {
             BackHandler { screen = Screen.List }
             NearbyScreen(
@@ -327,6 +355,7 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
                 onBack = { screen = Screen.List },
                 // Without a scanned reference point, the nearest Bluetooth beacon is the starting point.
                 beaconFix = if (current.located == null) beaconLocator.fix else null,
+                beaconPosition = if (current.located == null) beaconLocator.position else null,
                 beacons = beacons,
             )
         }
@@ -347,6 +376,7 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
                 hasBeacons = beacons.isNotEmpty(),
                 onFixBeaconAccess = ::fixBeaconAccess,
                 onOpenBeaconNearby = { screen = Screen.Nearby(null) },
+                onOpenBeaconPath = { screen = Screen.BeaconPath },
                 onAddDestination = { screen = Screen.Capture() },
                 onWalkAndConnect = { fromRefId, targetId ->
                     screen = Screen.Capture(fromRefId = fromRefId, connectTargetId = targetId)
@@ -381,6 +411,7 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
             onReferenceSizeMeasured = ::saveMeasuredSize,
             existingWalkedPoints = allWalkedPoints,
             existingObjects = allPlacedObjects,
+            beacons = beacons,
             initialFromRefId = current.fromRefId,
             initialConnectTargetId = current.connectTargetId,
             onSave = { captured ->
@@ -572,6 +603,8 @@ private fun DestinationListScreen(
     onFixBeaconAccess: () -> Unit = {},
     /** User mode: routes from the nearest beacon to everything reachable ("From here"). */
     onOpenBeaconNearby: () -> Unit = {},
+    /** User mode: the camera guided by Bluetooth beacons alone, without a reference point. */
+    onOpenBeaconPath: () -> Unit = {},
     onAddDestination: () -> Unit,
     onWalkAndConnect: (fromRefId: String?, targetId: String?) -> Unit = { _, _ -> },
     placedObjects: List<PlacedObject> = emptyList(),
@@ -665,14 +698,15 @@ private fun DestinationListScreen(
                         when {
                             beaconFix != null -> {
                                 val floor = venue.level(beaconFix.beacon.floorId)?.name?.resolved() ?: beaconFix.beacon.floorId
-                                val howClose = if (beaconFix.isClose) "right by it"
-                                else "within about %.0f m".format(beaconFix.uncertaintyMeters)
+                                val howClose = beaconFix.howNear
+                                // Routes and the 2D map need the beacon's position; without one, Beacon path guides.
+                                val placed = beaconFix.beacon.hasPosition
                                 IosRow(
                                     title = "You're near ${beaconFix.beacon.name}",
                                     glyph = "📶",
-                                    subtitle = "$floor · $howClose · tap for routes from here",
+                                    subtitle = "$floor · $howClose · " + if (placed) "tap for routes from here" else "tap for Beacon path",
                                     trailing = "${beaconFix.rssi} dBm",
-                                    onClick = onOpenBeaconNearby,
+                                    onClick = if (placed) onOpenBeaconNearby else onOpenBeaconPath,
                                 )
                             }
                             beaconProblem == BleScanner.Problem.NO_BLUETOOTH_LE -> IosRow(
@@ -709,6 +743,13 @@ private fun DestinationListScreen(
                             glyph = "📷",
                             subtitle = "Match a reference point to see nearby list & 2D map",
                             onClick = onOpenCamera,
+                        )
+                        IosRowDivider()
+                        IosRow(
+                            title = "Beacon path",
+                            glyph = "📡",
+                            subtitle = "Open the camera: Bluetooth beacons find where you are, no reference point needed",
+                            onClick = onOpenBeaconPath,
                         )
                     }
                 }

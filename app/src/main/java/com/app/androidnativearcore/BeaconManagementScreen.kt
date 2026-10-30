@@ -144,7 +144,7 @@ fun BeaconManagementScreen(
                     isNew = true
                     editing = RegisteredBeacon(
                         beaconId = Beacons.nextId(beacons), name = "", buildingId = venue.id,
-                        floorId = venue.levels.firstOrNull()?.id.orEmpty(), x = Float.NaN, y = Float.NaN,
+                        floorId = venue.levels.firstOrNull()?.id.orEmpty(),
                     )
                 },
             )
@@ -196,7 +196,6 @@ fun BeaconManagementScreen(
                                 macAddress = device.address,
                                 buildingId = venue.id,
                                 floorId = venue.levels.firstOrNull()?.id.orEmpty(),
-                                x = Float.NaN, y = Float.NaN,
                             )
                         }
                     },
@@ -221,7 +220,8 @@ fun BeaconManagementScreen(
                             IosRow(
                                 title = beacon.name,
                                 glyph = "📶",
-                                subtitle = "${beacon.identityLabel} · X %.1f, Y %.1f m".format(beacon.x, beacon.y),
+                                subtitle = beacon.identityLabel + (positionLabel(beacon)?.let { " · $it" } ?: " · found by signal") +
+                                    (beacon.rssiAt1m?.let { " · calibrated $it dBm" } ?: " · not calibrated"),
                                 onClick = { isNew = false; editing = beacon },
                             )
                             if (index < onFloor.lastIndex) IosRowDivider()
@@ -260,6 +260,8 @@ fun BeaconManagementScreen(
             onDelete = { onDelete(it); editing = null },
             onUsePosition = { draft -> editing = null; onPickPosition(draft, isNew) },
             onDismiss = { editing = null },
+            scan = scan,
+            onStartScan = ::startScan,
         )
     }
 }
@@ -368,6 +370,9 @@ private fun BeaconEditor(
     onDelete: (RegisteredBeacon) -> Unit,
     onUsePosition: (RegisteredBeacon) -> Unit,
     onDismiss: () -> Unit,
+    /** The screen's scan, for calibrating; [onStartScan] starts it (asking for what it needs). */
+    scan: NearbyScan,
+    onStartScan: () -> Unit,
 ) {
     var name by remember { mutableStateOf(initial.name) }
     var uuid by remember { mutableStateOf(initial.uuid) }
@@ -375,18 +380,43 @@ private fun BeaconEditor(
     var minor by remember { mutableStateOf(initial.minor?.toString().orEmpty()) }
     var mac by remember { mutableStateOf(initial.macAddress) }
     var floorId by remember { mutableStateOf(initial.floorId) }
-    // A position not set yet (NaN) shows as empty fields.
-    var x by remember { mutableStateOf(if (initial.x.isNaN()) "" else "%.2f".format(java.util.Locale.US, initial.x)) }
-    var y by remember { mutableStateOf(if (initial.y.isNaN()) "" else "%.2f".format(java.util.Locale.US, initial.y)) }
+    // A position not set shows as empty fields.
+    var x by remember { mutableStateOf(initial.x?.let { "%.2f".format(java.util.Locale.US, it) }.orEmpty()) }
+    var y by remember { mutableStateOf(initial.y?.let { "%.2f".format(java.util.Locale.US, it) }.orEmpty()) }
     var problems by remember { mutableStateOf(emptyList<String>()) }
     var confirmDelete by remember { mutableStateOf(false) }
+    // The beacon's signal 1 m away, measured here; and while measuring, the seconds left.
+    var rssiAt1m by remember { mutableStateOf(initial.rssiAt1m) }
+    var calibrating by remember { mutableStateOf(0) }
+    var calibrationNote by remember { mutableStateOf<String?>(null) }
 
     /** The form as typed, unchecked, to keep while the camera finds the position. */
     fun draft() = initial.copy(
         name = name, uuid = Beacons.normalizeUuid(uuid) ?: uuid, major = major.trim().toIntOrNull(),
         minor = minor.trim().toIntOrNull(), macAddress = Beacons.normalizeMac(mac) ?: mac, floorId = floorId,
-        x = x.trim().replace(',', '.').toFloatOrNull() ?: Float.NaN, y = y.trim().replace(',', '.').toFloatOrNull() ?: Float.NaN,
+        x = x.trim().replace(',', '.').toFloatOrNull(), y = y.trim().replace(',', '.').toFloatOrNull(), rssiAt1m = rssiAt1m,
     )
+
+    // Calibrating: the phone is held 1 m from the beacon; its smoothed signal settles for a couple of seconds, then
+    // the median over the rest is the beacon's signal at 1 m.
+    LaunchedEffect(calibrating > 0) {
+        if (calibrating == 0) return@LaunchedEffect
+        val beacon = draft()
+        val seen = mutableListOf<Int>()
+        for (step in 0 until CALIBRATE_STEPS) {
+            delay(CALIBRATE_STEP_MS)
+            calibrating = ((CALIBRATE_STEPS - step - 1) * CALIBRATE_STEP_MS / 1000 + 1).toInt()
+            if (step < CALIBRATE_SETTLE_STEPS) continue
+            scan.devices.firstOrNull { beacon.matches(it) }?.let { seen += it.rssi }
+        }
+        calibrating = 0
+        if (seen.size < CALIBRATE_MIN_READINGS) {
+            calibrationNote = "Not heard well enough. Check the beacon is on and its UUID (or address) is right, then try again."
+        } else {
+            rssiAt1m = seen.sorted()[seen.size / 2]
+            calibrationNote = null
+        }
+    }
 
     /** The form as a beacon, or the reasons it can't be one yet. */
     fun build(): Pair<RegisteredBeacon?, List<String>> {
@@ -395,11 +425,12 @@ private fun BeaconEditor(
         val normalizedMac = Beacons.normalizeMac(mac) ?: "".also { formatProblems += "The Bluetooth address should look like AA:BB:CC:DD:EE:FF." }
         val majorValue = major.trim().ifEmpty { null }?.let { it.toIntOrNull() ?: (-1).also { formatProblems += "Major must be a whole number." } }
         val minorValue = minor.trim().ifEmpty { null }?.let { it.toIntOrNull() ?: (-1).also { formatProblems += "Minor must be a whole number." } }
-        val xValue = x.trim().replace(',', '.').toFloatOrNull() ?: Float.NaN
-        val yValue = y.trim().replace(',', '.').toFloatOrNull() ?: Float.NaN
+        // Optional: empty means "no position"; something typed must be a number.
+        val xValue = x.trim().ifEmpty { null }?.let { it.replace(',', '.').toFloatOrNull() ?: Float.NaN }
+        val yValue = y.trim().ifEmpty { null }?.let { it.replace(',', '.').toFloatOrNull() ?: Float.NaN }
         val beacon = initial.copy(
             name = name.trim(), uuid = normalizedUuid, major = majorValue, minor = minorValue, macAddress = normalizedMac,
-            floorId = floorId, x = xValue, y = yValue,
+            floorId = floorId, x = xValue, y = yValue, rssiAt1m = rssiAt1m,
             createdAtMillis = if (isNew) System.currentTimeMillis() else initial.createdAtMillis,
         )
         val all = formatProblems + Beacons.problems(beacon, levels.map { it.id }.toSet(), others)
@@ -441,7 +472,13 @@ private fun BeaconEditor(
                         )
                     }
                 }
-                Text("Position on the floor plan (meters)", style = MaterialTheme.typography.labelLarge)
+                Text("Position on the floor plan (optional, meters)", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    "Leave empty to find this beacon by its signal alone. A position is only needed for the 2D map, " +
+                        "routes and AR markers.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         x, { x = it }, label = { Text("X") }, singleLine = true, modifier = Modifier.weight(1f),
@@ -454,6 +491,27 @@ private fun BeaconEditor(
                 }
                 // Instead of measuring: stand next to the beacon and let the camera say where that is on the map.
                 TextButton(onClick = { onUsePosition(draft()) }) { Text("📍 Use my current position") }
+                Text("Signal at 1 m (calibration)", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    rssiAt1m?.let { "$it dBm · calibrated" }
+                        ?: "Not calibrated: beacons differ in strength, so distances to this one are rough.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "Hold this phone 1 m from the beacon at chest height, keep still, and tap Calibrate.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(
+                    enabled = calibrating == 0,
+                    onClick = {
+                        if (!scan.scanning) onStartScan()
+                        calibrationNote = null
+                        calibrating = (CALIBRATE_STEPS * CALIBRATE_STEP_MS / 1000).toInt()
+                    },
+                ) { Text(if (calibrating > 0) "Measuring… keep still (${calibrating}s)" else "📏 Calibrate at 1 m") }
+                calibrationNote?.let { Text("⚠ $it", color = Color(0xFFD32F2F), style = MaterialTheme.typography.bodySmall) }
                 for (problem in problems) Text("⚠ $problem", color = Color(0xFFD32F2F), style = MaterialTheme.typography.bodySmall)
                 if (!isNew) {
                     TextButton(onClick = { confirmDelete = true }) { Text("Delete beacon", color = Color(0xFFD32F2F)) }
@@ -480,3 +538,18 @@ private fun BeaconEditor(
         )
     }
 }
+
+/** "X 1.4, Y -12.4 m", or null for a beacon without a position. */
+private fun positionLabel(beacon: RegisteredBeacon): String? {
+    val x = beacon.x ?: return null
+    val y = beacon.y ?: return null
+    return "X %.1f, Y %.1f m".format(x, y)
+}
+
+/** Calibrating takes [CALIBRATE_STEPS] × [CALIBRATE_STEP_MS] (8 s): the first [CALIBRATE_SETTLE_STEPS] let the smoothed signal settle. */
+private const val CALIBRATE_STEPS = 32
+private const val CALIBRATE_STEP_MS = 250L
+private const val CALIBRATE_SETTLE_STEPS = 8
+
+/** Fewest readings of the beacon for a calibration to count. */
+private const val CALIBRATE_MIN_READINGS = 8

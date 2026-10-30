@@ -71,6 +71,7 @@ import com.app.androidnativearcore.wayfinder.core.PlacedObject
 import com.app.androidnativearcore.wayfinder.core.PlacedObjectKind
 import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
 import com.app.androidnativearcore.wayfinder.core.ReferenceGeometry
+import com.app.androidnativearcore.wayfinder.core.RegisteredBeacon
 import com.app.androidnativearcore.wayfinder.core.Route
 import com.app.androidnativearcore.wayfinder.core.RoutePlanner
 import com.app.androidnativearcore.wayfinder.core.RouteProfile
@@ -284,6 +285,8 @@ fun WayFinderCaptureScreen(
     existingWalkedPoints: List<WalkedPoint> = emptyList(),
     /** Previously saved 3D objects from earlier destinations, rendered in the live camera video. */
     existingObjects: List<PlacedObject> = emptyList(),
+    /** The registered Bluetooth beacons, drawn in the camera at their spots once the map is found. */
+    beacons: List<RegisteredBeacon> = emptyList(),
 ) {
     val venue = pkg.venue
     val defaultLevel = venue.levels.firstOrNull()?.id.orEmpty()
@@ -1235,6 +1238,14 @@ fun WayFinderCaptureScreen(
                 ObjectsScene(allVenueObjects, stable.display, cameraPosition)
                 // Render all reference points (saved + captured this session) with BLUE pins and BLUE text labels
                 ReferencePointsScene(allRefPins, stable.display, cameraPosition)
+                // The registered Bluetooth beacons on this floor, standing on the floor at their spots.
+                val level = startMarker?.level ?: defaultLevel
+                BeaconsScene(
+                    beacons = beacons.filter { it.floorId == level },
+                    floorY = stable.display.inverse().transformPoint(Vec3(0f, floorSessionY(), 0f)).y,
+                    alignment = stable.display,
+                    cameraPosition = cameraPosition,
+                )
             }
             ObjectsScene(sessionObjects.toList(), Mat4.IDENTITY, cameraPosition)
         }
