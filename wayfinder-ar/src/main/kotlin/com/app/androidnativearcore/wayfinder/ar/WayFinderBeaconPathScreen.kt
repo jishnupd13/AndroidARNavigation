@@ -27,8 +27,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -66,6 +68,7 @@ import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.math.Position
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.hypot
 
@@ -110,6 +113,8 @@ fun WayFinderBeaconPathScreen(
     onFixProblem: (() -> Unit)?,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Debug builds: a panel to check the beacon rules on a real device, case by case ([BeaconTestPanel]). */
+    testPanel: Boolean = false,
 ) {
     var targetId by rememberSaveable { mutableStateOf<String?>(null) }
     val target = beacons.firstOrNull { it.beaconId == targetId }
@@ -154,6 +159,35 @@ fun WayFinderBeaconPathScreen(
     val placements = remember { mutableMapOf<String, Placement>() }
     val arSession = remember { arrayOfNulls<Session>(1) }
     val currentHeard by rememberUpdatedState(heard)
+
+    // The rule tests (debug builds): each case records what the screen shows a few seconds after it is tapped.
+    var testOpen by remember { mutableStateOf(false) }
+    val testResults = remember { mutableStateListOf<BeaconTestResult>() }
+    var testRecording by remember { mutableStateOf<BeaconTestCase?>(null) }
+    var testReference by remember { mutableStateOf<Vec3?>(null) }
+    val currentTarget by rememberUpdatedState(target)
+    val currentFix by rememberUpdatedState(fix)
+    val currentDetected by rememberUpdatedState(detected)
+    val scope = rememberCoroutineScope()
+    fun runTest(case: BeaconTestCase) {
+        scope.launch {
+            testRecording = case
+            delay(TEST_RECORD_AFTER_MS)
+            val beacon = currentTarget ?: currentFix?.beacon
+            val snapshot = BeaconTestSnapshot(
+                beacon = beacon,
+                signal = beacon?.let { b -> currentHeard.firstOrNull { it.beacon.beaconId == b.beaconId } },
+                detected = currentDetected,
+                icon = beacon?.let { logos[it.beaconId] },
+                reference = testReference,
+            )
+            val (result, reference) = judge(case, snapshot)
+            testReference = reference
+            testResults += result
+            Log.i(TEST_TAG, "result $session ${case.name} ${if (result.passed) "PASS" else "FAIL"} ${result.detail}")
+            testRecording = null
+        }
+    }
     LaunchedEffect(Unit) {
         while (true) {
             delay(DETECT_EVERY_MS)
@@ -354,7 +388,26 @@ fun WayFinderBeaconPathScreen(
                     Arrived(target, floorName(target.floorId), shown = target.beaconId in logos, onDone = { targetId = null })
                 }
             }
+            if (testPanel && testOpen) {
+                BeaconTestPanel(
+                    results = testResults,
+                    recording = testRecording,
+                    onRun = ::runTest,
+                    onClear = {
+                        testResults.clear()
+                        testReference = null
+                    },
+                )
+            }
             Box(Modifier.fillMaxWidth()) {
+                if (testPanel) {
+                    CircleButton(
+                        glyph = "🧪",
+                        description = "Beacon rule tests",
+                        onClick = { testOpen = !testOpen },
+                        modifier = Modifier.align(Alignment.CenterEnd),
+                    )
+                }
                 CircleButton(glyph = "✕", description = "Close: back to the destination list", onClick = onClose)
             }
         }
@@ -387,6 +440,12 @@ private const val LOGO_BELOW_M = 0.45f
 /** A surface seen in the middle of the view counts when it is this near (meters, along the line of sight). */
 private const val MIN_SURFACE_M = 0.15f
 private const val MAX_SURFACE_M = 2.5f
+
+/** The rule tests record this long (ms) after a case is tapped: time to hold still. */
+private const val TEST_RECORD_AFTER_MS = 3_000L
+
+/** Log tag for the rule tests' results. */
+private const val TEST_TAG = "WFBeaconTest"
 
 /** Log tag for the beacon logos: readings with phone positions, and when each logo shows and hides. */
 private const val SPOT_TAG = "WFBeaconSpot"

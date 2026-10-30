@@ -340,6 +340,8 @@ private fun WayFinderHost(basePackage: VenuePackage, incomingBundle: Uri?, onInc
                 beacons.isNotEmpty() && beaconLocator.problem != BleScanner.Problem.NO_BLUETOOTH_LE
             },
             onClose = { screen = Screen.List },
+            // The rule tests are for checking on a device during development, not for visitors.
+            testPanel = (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0,
         )
         is Screen.Nearby -> {
             BackHandler { screen = Screen.List }
