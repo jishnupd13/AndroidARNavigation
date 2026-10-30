@@ -18,6 +18,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,62 +37,129 @@ import com.app.androidnativearcore.wayfinder.core.CustomDestination
 import com.app.androidnativearcore.wayfinder.core.REFERENCE_CATEGORY
 import com.app.androidnativearcore.wayfinder.core.Vec3
 import com.app.androidnativearcore.wayfinder.core.Venue
-import com.app.androidnativearcore.wayfinder.core.WalkedPathRouter
+import com.app.androidnativearcore.wayfinder.core.BeaconFix
+import com.app.androidnativearcore.wayfinder.core.ConnectionRoutePlanner
+import com.app.androidnativearcore.wayfinder.core.ConnectionRouteResult
+import com.app.androidnativearcore.wayfinder.core.RegisteredBeacon
+import com.app.androidnativearcore.wayfinder.core.RouteEndpoint
+import com.app.androidnativearcore.wayfinder.core.position
+import com.app.androidnativearcore.wayfinder.core.routeEndpoint
+import com.app.androidnativearcore.wayfinder.core.routeStart
 import com.app.androidnativearcore.wayfinder.core.WalkedPoint
-import com.app.androidnativearcore.wayfinder.core.WalkedRouteResult
 import com.app.androidnativearcore.wayfinder.core.referencePoiId
+
+/** How far (meters) a scanned starting point, or a reference point as a destination, may be from the walks. */
+private const val START_JOIN_M = 3f
+
+/** How far (meters) a saved destination may be from the walk recorded to it. */
+private const val DESTINATION_JOIN_M = 1.5f
 
 /** A place the user can go from where they stand, with the walking distance along the recorded paths. */
 private class Reachable(val poi: Venue.POI, val route: List<Vec3>?, val meters: Float?)
 
+/** A registered beacon as somewhere to go on the map, with the route to it along the recorded paths (if any). */
+private class BeaconTarget(val beacon: RegisteredBeacon, val route: List<Vec3>?, val meters: Float?)
+
 /**
- * "From here": after the camera recognized a reference point, every other point and destination on the level,
- * nearest first, as a list or on the 2D map. Picking one starts AR directions to it.
+ * "From here": every other point and destination on the level, nearest first along the recorded walks, as a list or
+ * on the 2D map. Picking one starts AR directions to it.
+ *
+ * "Here" is where the user was found: by the camera recognizing a reference point ([located]), or, without that, by
+ * the nearest Bluetooth beacon ([beaconFix]). The beacon estimate is coarse (the user is somewhere around the
+ * beacon), and it can change while the user walks: the distances and routes are worked out again whenever the
+ * nearest beacon changes. If the beacon goes quiet, the last one heard is kept and marked as such.
+ *
+ * The map also shows the registered [beacons]; tapping one shows the route to it. Where no recorded walk leads
+ * there, a dashed straight line gives the direction only. Once that beacon is the nearest one, the user has arrived.
  */
 @Composable
 fun NearbyScreen(
     venue: Venue,
     markers: List<Venue.Marker>,
     walked: List<WalkedPoint>,
-    located: LocatedUser,
+    located: LocatedUser?,
     onNavigate: (Venue.POI) -> Unit,
     onRescan: () -> Unit,
     onBack: () -> Unit,
+    beaconFix: BeaconFix? = null,
+    beacons: List<RegisteredBeacon> = emptyList(),
 ) {
-    val here = remember(located) { Vec3(located.x, 0f, located.z) }
-    val places = remember(venue, walked, located) {
-        val points = walked.filter { it.level == located.level }
-        val router = WalkedPathRouter(destinationJoinDistance = 3f)
+    // The last beacon heard, kept when it goes quiet so the list doesn't vanish.
+    var lastFix by remember { mutableStateOf(beaconFix) }
+    LaunchedEffect(beaconFix?.beacon?.beaconId) { if (beaconFix != null) lastFix = beaconFix }
+    val fix = beaconFix ?: lastFix
+    val start: RouteEndpoint? = located?.let { RouteEndpoint(it.marker.name.resolved(), Vec3(it.x, 0f, it.z), it.level, START_JOIN_M) }
+        ?: fix?.routeStart()
+    // Worked out again only when the starting point itself changes (another reference point or another beacon), not
+    // on every new signal reading.
+    val startKey = located?.let { "ref:${it.marker.id}:${it.x}:${it.z}" } ?: fix?.let { "beacon:${it.beacon.beaconId}" }
+    val places = remember(venue, walked, startKey) {
+        val from = start ?: return@remember emptyList()
+        val connections = ConnectionRoutePlanner(walked)
         venue.pois
-            .filter { it.level == located.level && (it.category == CustomDestination.CATEGORY || it.category == REFERENCE_CATEGORY) }
-            .filter { it.id != referencePoiId(located.marker.id) }
+            .filter { it.level == from.level && (it.category == CustomDestination.CATEGORY || it.category == REFERENCE_CATEGORY) }
+            .filter { located == null || it.id != referencePoiId(located.marker.id) }
             .map { poi ->
-                val result = router.route(here, Vec3(poi.x, 0f, poi.z), points)
-                val line = (result as? WalkedRouteResult.Success)?.points
-                Reachable(poi, line, line?.zipWithNext()?.sumOf { (a, b) -> a.distanceTo(b).toDouble() }?.toFloat())
+                // A saved destination is reached along its own walk; a reference point along any walk near it.
+                val goal = if (poi.category == CustomDestination.CATEGORY) {
+                    RouteEndpoint(poi.name.resolved(), Vec3(poi.x, 0f, poi.z), poi.level, DESTINATION_JOIN_M, poi.id.takeIf { id -> walked.any { it.destinationId == id } })
+                } else {
+                    RouteEndpoint(poi.name.resolved(), Vec3(poi.x, 0f, poi.z), poi.level, START_JOIN_M)
+                }
+                when (val result = connections.route(from, goal)) {
+                    is ConnectionRouteResult.Success -> Reachable(poi, result.points, result.lengthMeters)
+                    is ConnectionRouteResult.Failure -> Reachable(poi, null, null)
+                }
             }
             .sortedWith(compareBy({ it.meters == null }, { it.meters ?: 0f }))
     }
+    // The other beacons on the level, each with its route from here.
+    val beaconTargets = remember(walked, startKey, beacons) {
+        val from = start ?: return@remember emptyList()
+        val connections = ConnectionRoutePlanner(walked)
+        beacons.filter { it.floorId == from.level }.map { beacon ->
+            when (val result = connections.route(from, beacon.routeEndpoint())) {
+                is ConnectionRouteResult.Success -> BeaconTarget(beacon, result.points, result.lengthMeters)
+                is ConnectionRouteResult.Failure -> BeaconTarget(beacon, null, null)
+            }
+        }
+    }
     var showMap by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Reachable?>(null) }
-    val levelName = venue.level(located.level)?.name?.resolved().orEmpty()
+    var selectedBeaconId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(places) { selected = selected?.let { old -> places.firstOrNull { it.poi.id == old.poi.id } } }
+    val selectedBeacon = beaconTargets.firstOrNull { it.beacon.beaconId == selectedBeaconId }
+    val nearBeaconId = if (located == null) fix?.beacon?.beaconId else null
+    val level = start?.level ?: located?.level ?: fix?.beacon?.floorId.orEmpty()
+    val levelName = venue.level(level)?.name?.resolved().orEmpty()
 
     Scaffold { padding ->
         Column(Modifier.fillMaxSize().padding(padding).statusBarsPadding()) {
             Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onBack) { Text("‹ Home") }
                 Box(Modifier.weight(1f))
-                TextButton(onClick = onRescan) { Text("Scan again") }
+                TextButton(onClick = onRescan) { Text(if (located != null) "Scan again" else "Scan a reference point") }
             }
             Column(Modifier.padding(horizontal = 16.dp)) {
-                Text("You're at", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
-                    located.marker.name.resolved(),
+                    if (located != null) "You're at" else "You're near (Bluetooth)",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    located?.marker?.name?.resolved() ?: fix?.beacon?.name ?: "Looking for beacons…",
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Bold,
                 )
-                if (levelName.isNotEmpty()) {
-                    Text(levelName, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val detail = listOfNotNull(
+                    levelName.ifEmpty { null },
+                    if (located == null && fix != null) {
+                        if (fix.isClose) "right by the beacon" else "within about %.0f m of it".format(fix.uncertaintyMeters)
+                    } else null,
+                    if (located == null && fix != null && beaconFix == null) "last heard" else null,
+                ).joinToString(" · ")
+                if (detail.isNotEmpty()) {
+                    Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -126,16 +194,55 @@ fun NearbyScreen(
                 }
             } else {
                 Box(Modifier.weight(1f).fillMaxWidth()) {
+                    val arrived = selectedBeacon != null && selectedBeacon.beacon.beaconId == nearBeaconId
                     FloorMap(
-                        level = located.level,
+                        level = level,
                         walked = walked,
                         markers = markers,
                         destinations = places.map { it.poi },
-                        user = MapUser(located.x, located.z),
-                        route = selected?.route,
-                        selectedId = selected?.poi?.id,
-                        onSelect = { poi -> selected = places.firstOrNull { it.poi.id == poi.id } },
+                        user = start?.let { MapUser(it.position.x, it.position.z) },
+                        route = selected?.route ?: selectedBeacon?.route?.takeUnless { arrived },
+                        selectedId = selected?.poi?.id ?: selectedBeacon?.beacon?.beaconId,
+                        onSelect = { poi ->
+                            selected = places.firstOrNull { it.poi.id == poi.id }
+                            selectedBeaconId = null
+                        },
+                        beacons = beacons,
+                        nearBeaconId = nearBeaconId,
+                        onSelectBeacon = { beacon ->
+                            selectedBeaconId = beacon.beaconId
+                            selected = null
+                        },
+                        userUncertaintyMeters = if (located == null) fix?.uncertaintyMeters else null,
+                        straightLine = selectedBeacon?.takeIf { it.route == null && !arrived }?.let { target ->
+                            start?.let { listOf(it.position, target.beacon.position) }
+                        },
                     )
+                    selectedBeacon?.let { target ->
+                        Column(
+                            Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp)
+                                .clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surface).padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(target.beacon.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(
+                                "Bluetooth beacon" + (levelName.takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            val straight = start?.position?.let { "%.1f m".format(it.distanceTo(target.beacon.position)) }
+                            Text(
+                                when {
+                                    arrived -> "You've arrived: this is the beacon you're nearest to now."
+                                    target.meters != null -> "%.0f m along the recorded path".format(target.meters)
+                                    else -> "No recorded path to it yet. The dashed line is the straight line ($straight), not a walking route."
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (arrived) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (arrived) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                    }
                     selected?.let { place ->
                         Column(
                             Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp)
